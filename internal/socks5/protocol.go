@@ -1,3 +1,6 @@
+// Package socks5 implements the RFC 1928 / RFC 1929 wire protocol primitives
+// used by both the frontend (serving clients) and the backend (dialing
+// upstreams), plus the SOCKS5 UDP request header codec.
 package socks5
 
 import (
@@ -9,6 +12,7 @@ import (
 	"net"
 )
 
+// Protocol constants.
 const (
 	Version = 0x05
 
@@ -16,7 +20,9 @@ const (
 	AuthUserPass = 0x02
 	AuthNoAccept = 0xFF
 
-	CmdConnect = 0x01
+	CmdConnect      = 0x01
+	CmdBind         = 0x02
+	CmdUDPAssociate = 0x03
 
 	AtypIPv4   = 0x01
 	AtypDomain = 0x03
@@ -33,50 +39,95 @@ const (
 	RepAddrTypeNotSupported = 0x08
 )
 
-// ReplyBytes returns a minimal BND.ADDR=0.0.0.0 BND.PORT=0 reply payload.
+// ReplyBytes returns a minimal reply payload with BND.ADDR = 0.0.0.0, BND.PORT = 0.
 func ReplyBytes(rep byte) []byte {
 	return []byte{Version, rep, 0x00, AtypIPv4, 0, 0, 0, 0, 0, 0}
 }
 
-// ReadGreeting handles the SOCKS5 method-negotiation greeting and replies
-// with AuthNone. Returns an error on protocol violations.
+// BuildReply constructs a SOCKS5 reply with the given bind address/port.
+// If bindHost/bindPort are zero, emits the minimal 0.0.0.0:0 form.
+func BuildReply(rep byte, bindIP net.IP, bindPort uint16) []byte {
+	if bindIP == nil {
+		return ReplyBytes(rep)
+	}
+	var atyp byte
+	var addr []byte
+	if v4 := bindIP.To4(); v4 != nil {
+		atyp = AtypIPv4
+		addr = v4
+	} else {
+		atyp = AtypIPv6
+		addr = bindIP.To16()
+	}
+	out := make([]byte, 0, 4+len(addr)+2)
+	out = append(out, Version, rep, 0x00, atyp)
+	out = append(out, addr...)
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, bindPort)
+	out = append(out, portBuf...)
+	return out
+}
+
+// ReadGreeting performs RFC 1928 method negotiation on the client side.
+// We only support NoAuth on the frontend in this release; any client that
+// doesn't offer NoAuth is rejected per RFC with reply 0xFF.
 func ReadGreeting(client net.Conn, br *bufio.Reader) error {
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return err
+		return fmt.Errorf("read greeting header: %w", err)
 	}
 	if hdr[0] != Version || hdr[1] == 0 {
 		return errors.New("bad greeting")
 	}
 	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(br, methods); err != nil {
-		return err
+		return fmt.Errorf("read methods: %w", err)
 	}
-	_, err := client.Write([]byte{Version, AuthNone})
-	return err
+
+	accepted := false
+	for _, m := range methods {
+		if m == AuthNone {
+			accepted = true
+			break
+		}
+	}
+	if !accepted {
+		_, _ = client.Write([]byte{Version, AuthNoAccept})
+		return errors.New("no acceptable auth method (client did not offer NoAuth)")
+	}
+	if _, err := client.Write([]byte{Version, AuthNone}); err != nil {
+		return fmt.Errorf("write greeting reply: %w", err)
+	}
+	return nil
 }
 
-// Request is a parsed client CONNECT request.
+// Request is a parsed SOCKS5 client request.
 type Request struct {
+	Cmd      byte
 	Atyp     byte
-	RawAddr  []byte // For domain: includes length prefix (suitable for relay).
+	RawAddr  []byte // Domain includes the 1-byte length prefix.
 	Port     uint16
-	DstLabel string // Human-readable "host" (no port).
+	DstLabel string // Human-readable host (no port).
 }
 
-// ReadRequest parses a SOCKS5 CONNECT request from the client.
-// On unsupported CMD/ATYP it writes the appropriate reply and returns an error.
+// ReadRequest parses a SOCKS5 request header. Supports CONNECT and
+// UDP_ASSOCIATE; BIND is rejected with RepCommandNotSupported. On protocol
+// errors we write the appropriate reply to `client` before returning.
+//
+// Returns (req, replyWrittenCode, err). `replyWrittenCode` is nonzero iff
+// this function wrote a reply to the client.
 func ReadRequest(client net.Conn, br *bufio.Reader) (*Request, byte, error) {
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("read request header: %w", err)
 	}
 	if hdr[0] != Version {
 		return nil, 0, errors.New("bad request version")
 	}
-	if hdr[1] != CmdConnect {
+	cmd := hdr[1]
+	if cmd != CmdConnect && cmd != CmdUDPAssociate {
 		_, _ = client.Write(ReplyBytes(RepCommandNotSupported))
-		return nil, RepCommandNotSupported, errors.New("unsupported cmd")
+		return nil, RepCommandNotSupported, fmt.Errorf("unsupported cmd 0x%02x", cmd)
 	}
 	atyp := hdr[3]
 	raw, port, label, err := readDest(br, atyp)
@@ -84,7 +135,7 @@ func ReadRequest(client net.Conn, br *bufio.Reader) (*Request, byte, error) {
 		_, _ = client.Write(ReplyBytes(RepAddrTypeNotSupported))
 		return nil, RepAddrTypeNotSupported, err
 	}
-	return &Request{Atyp: atyp, RawAddr: raw, Port: port, DstLabel: label}, 0, nil
+	return &Request{Cmd: cmd, Atyp: atyp, RawAddr: raw, Port: port, DstLabel: label}, 0, nil
 }
 
 func readDest(r io.Reader, atyp byte) ([]byte, uint16, string, error) {
@@ -118,7 +169,7 @@ func readDest(r io.Reader, atyp byte) ([]byte, uint16, string, error) {
 		label = string(dom)
 		raw = append(lb, dom...)
 	default:
-		return nil, 0, "", errors.New("unsupported atyp")
+		return nil, 0, "", fmt.Errorf("unsupported atyp 0x%02x", atyp)
 	}
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(r, portBuf); err != nil {
@@ -127,8 +178,8 @@ func readDest(r io.Reader, atyp byte) ([]byte, uint16, string, error) {
 	return raw, binary.BigEndian.Uint16(portBuf), label, nil
 }
 
-// ClientHandshake performs the method negotiation + optional user/pass
-// authentication as a SOCKS5 *client* (used when dialing an upstream).
+// ClientHandshake performs RFC 1928 method negotiation + optional RFC 1929
+// user/pass authentication as a SOCKS5 *client* (when dialing an upstream).
 func ClientHandshake(conn net.Conn, user, pass string) error {
 	haveCreds := user != "" || pass != ""
 	var greet []byte
@@ -138,11 +189,11 @@ func ClientHandshake(conn net.Conn, user, pass string) error {
 		greet = []byte{Version, 0x01, AuthNone}
 	}
 	if _, err := conn.Write(greet); err != nil {
-		return err
+		return fmt.Errorf("write greeting: %w", err)
 	}
 	resp := make([]byte, 2)
 	if _, err := io.ReadFull(conn, resp); err != nil {
-		return err
+		return fmt.Errorf("read greeting reply: %w", err)
 	}
 	if resp[0] != Version {
 		return fmt.Errorf("bad version %d", resp[0])
@@ -152,11 +203,11 @@ func ClientHandshake(conn net.Conn, user, pass string) error {
 		return nil
 	case AuthUserPass:
 		if !haveCreds {
-			return errors.New("upstream requires auth")
+			return errors.New("upstream requires auth but no credentials configured")
 		}
 		u, p := []byte(user), []byte(pass)
 		if len(u) > 255 || len(p) > 255 {
-			return errors.New("credential too long")
+			return errors.New("credential exceeds 255 bytes")
 		}
 		req := make([]byte, 0, 3+len(u)+len(p))
 		req = append(req, 0x01, byte(len(u)))
@@ -164,11 +215,11 @@ func ClientHandshake(conn net.Conn, user, pass string) error {
 		req = append(req, byte(len(p)))
 		req = append(req, p...)
 		if _, err := conn.Write(req); err != nil {
-			return err
+			return fmt.Errorf("write auth: %w", err)
 		}
 		ar := make([]byte, 2)
 		if _, err := io.ReadFull(conn, ar); err != nil {
-			return err
+			return fmt.Errorf("read auth reply: %w", err)
 		}
 		if ar[1] != 0x00 {
 			return errors.New("auth rejected")
@@ -181,52 +232,82 @@ func ClientHandshake(conn net.Conn, user, pass string) error {
 	}
 }
 
-// ClientConnect issues CONNECT over an authenticated session and returns the
-// reply code from the upstream.
-func ClientConnect(conn net.Conn, atyp byte, rawAddr []byte, port uint16) (byte, error) {
+// ClientRequest is the reply summary of a SOCKS5 request from an upstream.
+type ClientRequestReply struct {
+	Rep      byte
+	BindAtyp byte
+	BindIP   net.IP // populated for IPv4/IPv6 replies
+	BindHost string // populated for Domain replies
+	BindPort uint16
+}
+
+// ClientConnect issues CONNECT over an authenticated session and returns
+// the upstream's reply (including the bind address, which matters for UDP).
+func ClientConnect(conn net.Conn, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+	return clientRequest(conn, CmdConnect, atyp, rawAddr, port)
+}
+
+// ClientUDPAssociate issues UDP_ASSOCIATE and returns the upstream's reply.
+// The bind address in the reply is the upstream's UDP relay endpoint.
+func ClientUDPAssociate(conn net.Conn, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+	return clientRequest(conn, CmdUDPAssociate, atyp, rawAddr, port)
+}
+
+func clientRequest(conn net.Conn, cmd, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+	var out ClientRequestReply
+
 	req := make([]byte, 0, 6+len(rawAddr))
-	req = append(req, Version, CmdConnect, 0x00, atyp)
+	req = append(req, Version, cmd, 0x00, atyp)
 	req = append(req, rawAddr...)
 	portBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBuf, port)
 	req = append(req, portBuf...)
 	if _, err := conn.Write(req); err != nil {
-		return 0, err
+		return out, fmt.Errorf("write request: %w", err)
 	}
 
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return 0, err
+		return out, fmt.Errorf("read reply header: %w", err)
 	}
 	if hdr[0] != Version {
-		return 0, errors.New("bad reply version")
+		return out, errors.New("bad reply version")
 	}
-	rep := hdr[1]
+	out.Rep = hdr[1]
+	out.BindAtyp = hdr[3]
 
 	switch hdr[3] {
 	case AtypIPv4:
-		if _, err := io.ReadFull(conn, make([]byte, 4)); err != nil {
-			return 0, err
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return out, err
 		}
+		out.BindIP = net.IP(buf)
 	case AtypIPv6:
-		if _, err := io.ReadFull(conn, make([]byte, 16)); err != nil {
-			return 0, err
+		buf := make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return out, err
 		}
+		out.BindIP = net.IP(buf)
 	case AtypDomain:
 		lb := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lb); err != nil {
-			return 0, err
+			return out, err
 		}
-		if _, err := io.ReadFull(conn, make([]byte, lb[0])); err != nil {
-			return 0, err
+		dom := make([]byte, lb[0])
+		if _, err := io.ReadFull(conn, dom); err != nil {
+			return out, err
 		}
+		out.BindHost = string(dom)
 	default:
-		return 0, fmt.Errorf("bad reply atyp 0x%02x", hdr[3])
+		return out, fmt.Errorf("bad reply atyp 0x%02x", hdr[3])
 	}
-	if _, err := io.ReadFull(conn, make([]byte, 2)); err != nil {
-		return 0, err
+	pb := make([]byte, 2)
+	if _, err := io.ReadFull(conn, pb); err != nil {
+		return out, err
 	}
-	return rep, nil
+	out.BindPort = binary.BigEndian.Uint16(pb)
+	return out, nil
 }
 
 // AtypLabel returns a metric-safe string for an address type.
@@ -240,6 +321,20 @@ func AtypLabel(a byte) string {
 		return "domain"
 	default:
 		return "unknown"
+	}
+}
+
+// CmdLabel returns a metric-safe string for a command byte.
+func CmdLabel(c byte) string {
+	switch c {
+	case CmdConnect:
+		return "connect"
+	case CmdBind:
+		return "bind"
+	case CmdUDPAssociate:
+		return "udp_associate"
+	default:
+		return fmt.Sprintf("0x%02x", c)
 	}
 }
 

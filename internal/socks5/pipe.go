@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// TuneSocket enables TCP_NODELAY and (optionally) keepalive on a net.Conn.
+// TuneSocket enables TCP_NODELAY and (optionally) keepalive on a *net.TCPConn.
 // Safe to call with non-TCP conns (no-op).
 func TuneSocket(conn net.Conn, keepalive bool) {
 	tcp, ok := conn.(*net.TCPConn)
@@ -21,12 +21,12 @@ func TuneSocket(conn net.Conn, keepalive bool) {
 	}
 }
 
-// Pipe bridges client<->upstream bidirectionally.
-// Returns (bytesFromClientToUpstream, bytesFromUpstreamToClient).
+// Pipe bridges client<->upstream bidirectionally over TCP.
+// Returns (bytesClientToUpstream, bytesUpstreamToClient).
 //
 // On Linux with idle==0, io.Copy over *net.TCPConn engages splice(2) for
-// kernel-level zero-copy.  Setting idle>0 forces the poller path (no splice)
-// but enables per-direction idle timeouts.
+// kernel-level zero-copy. Setting idle>0 forces the poller path but enables
+// per-direction idle timeouts.
 func Pipe(client, upstream net.Conn, idle time.Duration) (up, down int64) {
 	type result struct {
 		n   int64
@@ -44,19 +44,18 @@ func Pipe(client, upstream net.Conn, idle time.Duration) (up, down int64) {
 		downCh <- result{n, err}
 	}()
 
-	var first result
 	select {
-	case first = <-upCh:
+	case r := <-upCh:
 		if tc, ok := upstream.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
-		up = first.n
+		up = r.n
 		down = (<-downCh).n
-	case first = <-downCh:
+	case r := <-downCh:
 		if tc, ok := client.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
-		down = first.n
+		down = r.n
 		up = (<-upCh).n
 	}
 	return up, down

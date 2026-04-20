@@ -1,17 +1,21 @@
 package strategy
 
-import "github.com/khodaparastan/socks5lb/internal/upstream"
+import (
+	"math/rand/v2"
+
+	"github.com/khodaparastan/socks5lb/internal/upstream"
+)
 
 // RandomSelector picks a uniformly-random eligible upstream.
-type RandomSelector struct{ rng *lockedRand }
+type RandomSelector struct{}
 
-func NewRandom() *RandomSelector       { return &RandomSelector{rng: newLockedRand()} }
+func NewRandom() *RandomSelector       { return &RandomSelector{} }
 func (s *RandomSelector) Name() string { return "random" }
 
-func (s *RandomSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
-	cands := eligible(pool, max)
+func (s *RandomSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
+	cands := eligible(pool, maxPer)
 	if len(cands) == 0 {
-		return nil
+		return ""
 	}
-	return cands[s.rng.Intn(len(cands))]
+	return cands[rand.IntN(len(cands))].ID
 }

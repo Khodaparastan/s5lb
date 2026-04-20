@@ -1,20 +1,24 @@
 package strategy
 
-import "github.com/khodaparastan/socks5lb/internal/upstream"
+import (
+	"math/rand/v2"
 
-// LeastActiveSelector picks the upstream with the fewest active connections,
-// randomizing ties to avoid hot-spotting the first slice element.
-type LeastActiveSelector struct{ rng *lockedRand }
+	"github.com/khodaparastan/socks5lb/internal/upstream"
+)
 
-func NewLeastActive() *LeastActiveSelector  { return &LeastActiveSelector{rng: newLockedRand()} }
+// LeastActiveSelector picks the upstream with fewest active connections,
+// with random tie-breaking.
+type LeastActiveSelector struct{}
+
+func NewLeastActive() *LeastActiveSelector  { return &LeastActiveSelector{} }
 func (s *LeastActiveSelector) Name() string { return "least-active" }
 
-func (s *LeastActiveSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
-	cands := eligible(pool, max)
+func (s *LeastActiveSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
+	cands := eligible(pool, maxPer)
 	if len(cands) == 0 {
-		return nil
+		return ""
 	}
-	best := []*upstream.Upstream{cands[0]}
+	best := []upstream.Snapshot{cands[0]}
 	for _, u := range cands[1:] {
 		switch {
 		case u.Active < best[0].Active:
@@ -25,7 +29,7 @@ func (s *LeastActiveSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max i
 		}
 	}
 	if len(best) == 1 {
-		return best[0]
+		return best[0].ID
 	}
-	return best[s.rng.Intn(len(best))]
+	return best[rand.IntN(len(best))].ID
 }

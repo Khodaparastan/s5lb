@@ -2,32 +2,30 @@ package strategy
 
 import (
 	"math"
+	"math/rand/v2"
 
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
-// LeastLatencySelector picks the upstream with the lowest EWMA of
-// (dial + handshake) latency, lightly biased by current active count so
-// ties route to the less-loaded peer.  Unmeasured upstreams are preferred
-// once (so newcomers get a chance to gather samples).
-type LeastLatencySelector struct{ rng *lockedRand }
+// LeastLatencySelector picks the upstream with lowest EWMA latency, lightly
+// biased by active count. Unmeasured upstreams get a near-zero boost so they
+// get sampled.
+type LeastLatencySelector struct{}
 
-func NewLeastLatency() *LeastLatencySelector {
-	return &LeastLatencySelector{rng: newLockedRand()}
-}
+func NewLeastLatency() *LeastLatencySelector { return &LeastLatencySelector{} }
 func (s *LeastLatencySelector) Name() string { return "least-latency" }
 
-func (s *LeastLatencySelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
-	cands := eligible(pool, max)
+func (s *LeastLatencySelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
+	cands := eligible(pool, maxPer)
 	if len(cands) == 0 {
-		return nil
+		return ""
 	}
-	var tied []*upstream.Upstream
+	var tied []upstream.Snapshot
 	bestScore := math.MaxFloat64
 	for _, u := range cands {
-		lat := u.EWMALatency()
+		lat := u.EWMALatency
 		if lat <= 0 {
-			lat = 1e-9 // boost unmeasured so they get sampled
+			lat = 1e-9
 		}
 		score := lat * float64(1+u.Active)
 		switch {
@@ -40,7 +38,7 @@ func (s *LeastLatencySelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max 
 		}
 	}
 	if len(tied) == 1 {
-		return tied[0]
+		return tied[0].ID
 	}
-	return tied[s.rng.Intn(len(tied))]
+	return tied[rand.IntN(len(tied))].ID
 }

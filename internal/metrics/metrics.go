@@ -1,3 +1,4 @@
+// Package metrics wires up the Prometheus collectors for socks5lb.
 package metrics
 
 import (
@@ -7,12 +8,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
+// Metrics is the full collector set exposed on the admin port.
 type Metrics struct {
-	BuildInfo    *prometheus.GaugeVec
-	StrategyInfo *prometheus.GaugeVec
+	BuildInfo        *prometheus.GaugeVec
+	StrategyInfo     *prometheus.GaugeVec
+	BackpressureInfo *prometheus.GaugeVec
 
-	AcceptedTotal   prometheus.Counter
-	RejectedTotal   *prometheus.CounterVec
+	AcceptedTotal     prometheus.Counter
+	RejectedTotal     *prometheus.CounterVec
+	BackpressureEvict prometheus.Counter
+
 	ActiveSessions  prometheus.Gauge
 	AdmissionInFly  prometheus.Gauge
 	QueueDepth      prometheus.Gauge
@@ -32,8 +37,16 @@ type Metrics struct {
 	UpHandshake   *prometheus.HistogramVec
 	UpProbeSec    *prometheus.HistogramVec
 	UpLatencyEWMA *prometheus.GaugeVec
+
+	// UDP_ASSOCIATE.
+	UDPAssocActive     prometheus.Gauge
+	UDPSessionDuration prometheus.Histogram
+	UDPPackets         *prometheus.CounterVec
+	UDPBytes           *prometheus.CounterVec
+	UDPDropped         *prometheus.CounterVec
 }
 
+// New builds and registers every collector on the supplied registry.
 func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics {
 	latencyBuckets := []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
 	durBuckets := []float64{.1, 1, 10, 30, 60, 300, 900, 1800, 3600}
@@ -49,6 +62,11 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 			Help: "Active load-balancing strategy (always 1).",
 		}, []string{"strategy"}),
 
+		BackpressureInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "socks5lb_backpressure_info",
+			Help: "Active backpressure strategy (always 1).",
+		}, []string{"strategy"}),
+
 		AcceptedTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "socks5lb_connections_accepted_total",
 			Help: "TCP connections accepted on the frontend listener.",
@@ -57,9 +75,14 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 			Name: "socks5lb_connections_rejected_total",
 			Help: "Connections rejected/terminated, partitioned by reason.",
 		}, []string{"reason"}),
+		BackpressureEvict: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "socks5lb_backpressure_evictions_total",
+			Help: "Sessions evicted to admit a new client.",
+		}),
+
 		ActiveSessions: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "socks5lb_active_sessions",
-			Help: "Client sessions currently tunneling.",
+			Help: "TCP tunneling sessions currently active.",
 		}),
 		AdmissionInFly: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "socks5lb_admission_inflight",
@@ -81,12 +104,12 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 		}),
 		SessionBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "socks5lb_session_bytes_total",
-			Help: "Bytes copied during tunneling, by direction.",
+			Help: "Bytes copied during TCP tunneling, by direction.",
 		}, []string{"direction"}),
 
 		SocksRequest: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "socks5lb_socks_request_total",
-			Help: "SOCKS5 CONNECT requests by address type and outcome.",
+			Help: "SOCKS5 requests by address type and outcome.",
 		}, []string{"atyp", "result"}),
 		SocksReply: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "socks5lb_socks_reply_total",
@@ -111,7 +134,7 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 		}, []string{"upstream"}),
 		UpFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "socks5lb_upstream_failures_total",
-			Help: "Upstream failures by stage (dial/handshake/connect/probe).",
+			Help: "Upstream failures by stage.",
 		}, []string{"upstream", "stage"}),
 		UpDialSec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "socks5lb_upstream_dial_seconds",
@@ -132,11 +155,33 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 			Name: "socks5lb_upstream_ewma_latency_seconds",
 			Help: "EWMA of (dial+handshake) latency per upstream, seconds.",
 		}, []string{"upstream"}),
+
+		UDPAssocActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "socks5lb_udp_associations_active",
+			Help: "Active UDP_ASSOCIATE sessions.",
+		}),
+		UDPSessionDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "socks5lb_udp_session_duration_seconds",
+			Help:    "UDP_ASSOCIATE session duration.",
+			Buckets: durBuckets,
+		}),
+		UDPPackets: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "socks5lb_udp_packets_total",
+			Help: "UDP datagrams relayed, by direction.",
+		}, []string{"direction"}),
+		UDPBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "socks5lb_udp_bytes_total",
+			Help: "UDP payload bytes relayed, by direction.",
+		}, []string{"direction"}),
+		UDPDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "socks5lb_udp_dropped_total",
+			Help: "UDP datagrams dropped, by reason.",
+		}, []string{"reason"}),
 	}
 
 	reg.MustRegister(
-		m.BuildInfo, m.StrategyInfo,
-		m.AcceptedTotal, m.RejectedTotal,
+		m.BuildInfo, m.StrategyInfo, m.BackpressureInfo,
+		m.AcceptedTotal, m.RejectedTotal, m.BackpressureEvict,
 		m.ActiveSessions, m.AdmissionInFly,
 		m.QueueDepth, m.QueueWaitSec,
 		m.SessionDuration, m.SessionBytes,
@@ -145,12 +190,15 @@ func New(reg prometheus.Registerer, version, commit, buildDate string) *Metrics 
 		m.UpSessions, m.UpFailures,
 		m.UpDialSec, m.UpHandshake, m.UpProbeSec,
 		m.UpLatencyEWMA,
+		m.UDPAssocActive, m.UDPSessionDuration,
+		m.UDPPackets, m.UDPBytes, m.UDPDropped,
 	)
 
 	m.BuildInfo.WithLabelValues(version, commit, runtime.Version(), buildDate).Set(1)
 	return m
 }
 
+// RegisterRuntime registers the standard Go + process collectors.
 func RegisterRuntime(reg prometheus.Registerer) {
 	reg.MustRegister(
 		collectors.NewGoCollector(),

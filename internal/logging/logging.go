@@ -1,3 +1,4 @@
+// Package logging configures the process-wide slog handler.
 package logging
 
 import (
@@ -6,6 +7,7 @@ import (
 	"strings"
 )
 
+// ParseLevel maps a human string to slog.Level. Unknown -> Info.
 func ParseLevel(s string) slog.Level {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -21,6 +23,8 @@ func ParseLevel(s string) slog.Level {
 	}
 }
 
+// New builds a structured logger with the given level + format (json|text).
+// Attaches service metadata via .With().
 func New(level slog.Level, format, service, version string) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: level}
 	var h slog.Handler

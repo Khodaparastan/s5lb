@@ -7,40 +7,42 @@ import (
 )
 
 // WRRSelector implements nginx-style smooth weighted round-robin.
-// Produces a well-spread sequence proportional to Weight without bursts.
+// Per-upstream current weights are keyed by upstream ID so pool reloads
+// don't corrupt state.
 type WRRSelector struct {
 	mu      sync.Mutex
-	current []int
+	current map[string]int
 }
 
-func NewWRR(n int) *WRRSelector     { return &WRRSelector{current: make([]int, n)} }
+func NewWRR() *WRRSelector          { return &WRRSelector{current: make(map[string]int)} }
 func (s *WRRSelector) Name() string { return "weighted-round-robin" }
 
-func (s *WRRSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
+func (s *WRRSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.current) != len(pool) {
-		s.current = make([]int, len(pool))
-	}
+
 	total := 0
-	bestIdx := -1
-	for i, u := range pool {
-		if !u.Healthy || u.Active >= max {
+	bestID := ""
+	var bestCur int
+	for _, u := range pool {
+		if !u.Healthy || u.Active >= maxPer {
 			continue
 		}
 		w := u.Weight
 		if w <= 0 {
 			w = 1
 		}
-		s.current[i] += w
+		cur := s.current[u.ID] + w
+		s.current[u.ID] = cur
 		total += w
-		if bestIdx == -1 || s.current[i] > s.current[bestIdx] {
-			bestIdx = i
+		if bestID == "" || cur > bestCur {
+			bestID = u.ID
+			bestCur = cur
 		}
 	}
-	if bestIdx == -1 {
-		return nil
+	if bestID == "" {
+		return ""
 	}
-	s.current[bestIdx] -= total
-	return pool[bestIdx]
+	s.current[bestID] = bestCur - total
+	return bestID
 }

@@ -1,20 +1,22 @@
 package strategy
 
-import "github.com/khodaparastan/socks5lb/internal/upstream"
+import (
+	"math/rand/v2"
 
-// WeightedRandomSelector picks an eligible upstream with probability
-// proportional to its Weight.
-type WeightedRandomSelector struct{ rng *lockedRand }
+	"github.com/khodaparastan/socks5lb/internal/upstream"
+)
 
-func NewWeightedRandom() *WeightedRandomSelector {
-	return &WeightedRandomSelector{rng: newLockedRand()}
-}
-func (s *WeightedRandomSelector) Name() string { return "weighted-random" }
+// WeightedRandomSelector picks eligible upstreams with probability
+// proportional to Weight.
+type WeightedRandomSelector struct{}
 
-func (s *WeightedRandomSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
-	cands := eligible(pool, max)
+func NewWeightedRandom() *WeightedRandomSelector { return &WeightedRandomSelector{} }
+func (s *WeightedRandomSelector) Name() string   { return "weighted-random" }
+
+func (s *WeightedRandomSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
+	cands := eligible(pool, maxPer)
 	if len(cands) == 0 {
-		return nil
+		return ""
 	}
 	total := 0
 	for _, u := range cands {
@@ -25,18 +27,18 @@ func (s *WeightedRandomSelector) Pick(_ SelectCtx, pool []*upstream.Upstream, ma
 		total += w
 	}
 	if total <= 0 {
-		return cands[s.rng.Intn(len(cands))]
+		return cands[rand.IntN(len(cands))].ID
 	}
-	r := s.rng.Intn(total)
+	r := rand.IntN(total)
 	for _, u := range cands {
 		w := u.Weight
 		if w <= 0 {
 			w = 1
 		}
 		if r < w {
-			return u
+			return u.ID
 		}
 		r -= w
 	}
-	return cands[len(cands)-1]
+	return cands[len(cands)-1].ID
 }

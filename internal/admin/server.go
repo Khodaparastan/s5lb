@@ -1,4 +1,5 @@
-// Package admin exposes /metrics, /healthz, /readyz, /version, /debug/pprof.
+// Package admin exposes /metrics, /healthz, /readyz, /version, and
+// /debug/pprof endpoints on a private mux (not the global DefaultServeMux).
 package admin
 
 import (
@@ -8,7 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	_ "net/http/pprof" // side-effect: registers /debug/pprof on DefaultServeMux
+	"net/http/pprof"
 	"runtime"
 	"time"
 
@@ -16,31 +17,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// ReadinessProber lets the admin server check data-path readiness without a
-// hard dependency on the balancer package.
+// ReadinessProber lets the admin server check data-path readiness without
+// a hard dependency on the balancer package.
 type ReadinessProber interface {
 	AnyHealthy() bool
 }
 
-// Server is the HTTP admin endpoint.
+// Reloader is optionally invoked from POST /admin/reload.
+type Reloader interface {
+	Reload() error
+}
+
+// Server is the admin HTTP endpoint.
 type Server struct {
 	srv *http.Server
 	log *slog.Logger
 }
 
-// New constructs an admin server bound to `addr`.
-func New(addr string, prober ReadinessProber, reg *prometheus.Registry,
-	log *slog.Logger, version, commit, buildDate string) *Server {
-
+// New constructs an admin server. `reloader` may be nil to disable
+// POST /admin/reload.
+func New(
+	addr string,
+	prober ReadinessProber,
+	reloader Reloader,
+	reg *prometheus.Registry,
+	log *slog.Logger,
+	version, commit, buildDate string,
+) *Server {
 	mux := http.NewServeMux()
 
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		ErrorHandling: promhttp.ContinueOnError,
 	}))
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
 	})
+
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if prober.AnyHealthy() {
 			w.WriteHeader(http.StatusOK)
@@ -50,13 +64,33 @@ func New(addr string, prober ReadinessProber, reg *prometheus.Registry,
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = io.WriteString(w, "no healthy upstream")
 	})
+
 	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"version":%q,"commit":%q,"go":%q,"build_date":%q}`,
 			version, commit, runtime.Version(), buildDate)
 	})
-	// Re-route pprof off of DefaultServeMux to the admin port only.
-	mux.Handle("/debug/", http.DefaultServeMux)
+
+	// Explicit pprof registration on our private mux (no DefaultServeMux leak).
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	if reloader != nil {
+		mux.HandleFunc("/admin/reload", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			if err := reloader.Reload(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_, _ = io.WriteString(w, "reloaded\n")
+		})
+	}
 
 	return &Server{
 		srv: &http.Server{
@@ -68,8 +102,7 @@ func New(addr string, prober ReadinessProber, reg *prometheus.Registry,
 	}
 }
 
-// Start listens and serves in a goroutine; errors other than ErrServerClosed
-// are logged.
+// Start runs the admin server in a goroutine.
 func (a *Server) Start() {
 	go func() {
 		a.log.Info("admin_listening", "addr", a.srv.Addr)
@@ -79,5 +112,5 @@ func (a *Server) Start() {
 	}()
 }
 
-// Stop gracefully shuts down the admin HTTP server.
+// Stop gracefully shuts down the admin server.
 func (a *Server) Stop(ctx context.Context) { _ = a.srv.Shutdown(ctx) }

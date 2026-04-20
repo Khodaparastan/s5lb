@@ -7,7 +7,7 @@ LDFLAGS := -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test lint run clean
+.PHONY: build test lint run clean tidy
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/socks5lb ./cmd/socks5lb
@@ -18,9 +18,11 @@ test:
 lint:
 	go vet ./...
 
+tidy:
+	go mod tidy
+
 run: build
-	./bin/socks5lb -listen 127.0.0.1:1080 -admin-addr 127.0.0.1:9090 \
-		-upstream 127.0.0.1:1081 -log-level debug
+	./bin/socks5lb -config config.example.yaml -log-level debug
 
 clean:
 	rm -rf bin

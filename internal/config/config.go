@@ -1,160 +1,192 @@
+// Package config holds the runtime configuration, YAML loader, and upstream
+// specification parser.
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/strategy"
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
+// BackpressureStrategy selects admission behavior when MaxClients is saturated.
+type BackpressureStrategy string
+
+const (
+	BackpressureReject             BackpressureStrategy = "reject"
+	BackpressureWait               BackpressureStrategy = "wait"
+	BackpressureDropOldest         BackpressureStrategy = "drop-oldest"
+	BackpressureDropLowestPriority BackpressureStrategy = "drop-lowest-priority"
+)
+
+// HashKey selects which attribute feeds consistent-hash strategies.
+type HashKey string
+
+const (
+	HashClientIP    HashKey = "client-ip"
+	HashDestination HashKey = "destination"
+	HashDestHost    HashKey = "destination-host"
+)
+
+// Config is the top-level runtime configuration.
 type Config struct {
-	ListenAddr string
-	AdminAddr  string
+	ListenAddr string `yaml:"listen"`
+	AdminAddr  string `yaml:"admin"`
 
-	MaxPerProxy int
-	MaxClients  int
+	MaxPerProxy int `yaml:"max_per_proxy"`
+	MaxClients  int `yaml:"max_clients"`
 
-	HealthInterval   time.Duration
-	RetryBackoff     time.Duration
-	ConnectTimeout   time.Duration
-	HandshakeTimeout time.Duration
-	QueueWaitTimeout time.Duration
-	FailureThreshold int
-	FailureWindow    time.Duration
-	IdleTimeout      time.Duration
-	DrainTimeout     time.Duration
-	TCPKeepAlive     bool
+	HealthInterval   time.Duration `yaml:"health_interval"`
+	RetryBackoff     time.Duration `yaml:"retry_backoff"`
+	ConnectTimeout   time.Duration `yaml:"connect_timeout"`
+	HandshakeTimeout time.Duration `yaml:"handshake_timeout"`
+	QueueWaitTimeout time.Duration `yaml:"queue_wait_timeout"`
 
-	Strategy string
-	HashKey  strategy.HashKey
+	FailureThreshold int           `yaml:"failure_threshold"`
+	FailureWindow    time.Duration `yaml:"failure_window"`
 
-	LogLevel  slog.Level
-	LogFormat string
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
+
+	// Two-phase drain.
+	DrainSoftTimeout time.Duration `yaml:"drain_soft_timeout"`
+	DrainHardTimeout time.Duration `yaml:"drain_hard_timeout"`
+
+	TCPKeepAlive bool `yaml:"tcp_keepalive"`
+
+	Strategy string  `yaml:"strategy"`
+	HashKey  HashKey `yaml:"hash_key"`
+
+	// Backpressure.
+	Backpressure         BackpressureStrategy `yaml:"backpressure"`
+	AdmissionWaitTimeout time.Duration        `yaml:"admission_wait_timeout"`
+
+	// UDP ASSOCIATE.
+	UDPEnabled     bool          `yaml:"udp_enabled"`
+	UDPBindAddr    string        `yaml:"udp_bind"` // interface to bind the client-facing UDP socket; empty = same host as listen
+	UDPIdleTimeout time.Duration `yaml:"udp_idle_timeout"`
+
+	// OpenTelemetry.
+	OTel OTelConfig `yaml:"otel"`
+
+	// Logging.
+	LogLevel  slog.Level `yaml:"-"`
+	LogLevelS string     `yaml:"log_level"`
+	LogFormat string     `yaml:"log_format"`
+
+	// Upstreams (from file). Flag-specified upstreams are merged on top.
+	Upstreams []UpstreamSpec `yaml:"upstreams"`
 }
 
+// UpstreamSpec is the file-side form of an upstream definition.
+type UpstreamSpec struct {
+	ID       string `yaml:"id"`
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	Weight   int    `yaml:"weight"`
+	Priority int    `yaml:"priority"`
+}
+
+// OTelConfig controls tracing export.
+type OTelConfig struct {
+	Enabled     bool              `yaml:"enabled"`
+	Endpoint    string            `yaml:"endpoint"`     // e.g., "otel-collector:4317"
+	Insecure    bool              `yaml:"insecure"`     // true to disable TLS
+	ServiceName string            `yaml:"service_name"` // default "socks5lb"
+	SampleRatio float64           `yaml:"sample_ratio"` // 0.0–1.0, default 1.0
+	Headers     map[string]string `yaml:"headers"`
+}
+
+// Defaults returns a baseline config.
 func Defaults() Config {
 	return Config{
-		ListenAddr:       "127.0.0.1:1080",
-		AdminAddr:        "127.0.0.1:9090",
-		MaxPerProxy:      100,
-		MaxClients:       4096,
-		HealthInterval:   20 * time.Second,
-		RetryBackoff:     30 * time.Second,
-		ConnectTimeout:   5 * time.Second,
-		HandshakeTimeout: 10 * time.Second,
-		QueueWaitTimeout: 10 * time.Second,
-		FailureThreshold: 5,
-		FailureWindow:    30 * time.Second,
-		IdleTimeout:      0,
-		DrainTimeout:     10 * time.Second,
-		TCPKeepAlive:     true,
-		Strategy:         "least-active",
-		HashKey:          strategy.HashClientIP,
-		LogLevel:         slog.LevelInfo,
-		LogFormat:        "json",
+		ListenAddr:           "127.0.0.1:1080",
+		AdminAddr:            "127.0.0.1:9090",
+		MaxPerProxy:          100,
+		MaxClients:           4096,
+		HealthInterval:       20 * time.Second,
+		RetryBackoff:         30 * time.Second,
+		ConnectTimeout:       5 * time.Second,
+		HandshakeTimeout:     10 * time.Second,
+		QueueWaitTimeout:     10 * time.Second,
+		FailureThreshold:     5,
+		FailureWindow:        30 * time.Second,
+		IdleTimeout:          0,
+		DrainSoftTimeout:     20 * time.Second,
+		DrainHardTimeout:     10 * time.Second,
+		TCPKeepAlive:         true,
+		Strategy:             "least-active",
+		HashKey:              HashClientIP,
+		Backpressure:         BackpressureReject,
+		AdmissionWaitTimeout: 2 * time.Second,
+		UDPEnabled:           true,
+		UDPBindAddr:          "",
+		UDPIdleTimeout:       60 * time.Second,
+		OTel: OTelConfig{
+			Enabled:     false,
+			ServiceName: "socks5lb",
+			SampleRatio: 1.0,
+		},
+		LogLevel:  slog.LevelInfo,
+		LogFormat: "json",
 	}
 }
 
-// ParseUpstream accepts:
-//
-//	host:port
-//	user:pass@host:port                    (password may contain ':' or '@')
-//	socks5://user:pass@host:port?weight=N&priority=N
-//	host:port#w=N,p=N
-func ParseUpstream(spec string) (*upstream.Upstream, error) {
-	u := &upstream.Upstream{Healthy: true, Weight: 1, Priority: 0}
-
-	// Trailing "#k=v,k=v" shorthand.
-	if hash := strings.Index(spec, "#"); hash >= 0 {
-		applyShorthandParams(u, spec[hash+1:])
-		spec = spec[:hash]
+// Validate sanity-checks a Config. Call after all merges.
+func (c *Config) Validate() error {
+	if c.ListenAddr == "" {
+		return errors.New("listen addr is required")
 	}
-
-	if strings.Contains(spec, "://") {
-		p, err := url.Parse(spec)
-		if err != nil {
-			return nil, err
-		}
-		if p.Scheme != "socks5" && p.Scheme != "socks5h" {
-			return nil, fmt.Errorf("unsupported scheme %q", p.Scheme)
-		}
-		if p.User != nil {
-			u.Username = p.User.Username()
-			if pw, ok := p.User.Password(); ok {
-				u.Password = pw
-			}
-		}
-		host, portStr, err := net.SplitHostPort(p.Host)
-		if err != nil {
-			return nil, err
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, err
-		}
-		u.Host, u.Port = host, port
-		applyURLParams(u, p.Query())
-		return u, nil
+	if c.MaxPerProxy <= 0 {
+		return errors.New("max_per_proxy must be > 0")
 	}
-
-	hp := spec
-	if at := strings.LastIndex(spec, "@"); at >= 0 {
-		creds := spec[:at]
-		hp = spec[at+1:]
-		if colon := strings.Index(creds, ":"); colon >= 0 {
-			u.Username, u.Password = creds[:colon], creds[colon+1:]
-		} else {
-			u.Username = creds
-		}
+	if c.MaxClients <= 0 {
+		return errors.New("max_clients must be > 0")
 	}
-	host, portStr, err := net.SplitHostPort(hp)
-	if err != nil {
-		return nil, err
+	if c.ConnectTimeout <= 0 || c.HandshakeTimeout <= 0 {
+		return errors.New("connect/handshake timeouts must be > 0")
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, err
+	if c.DrainSoftTimeout < 0 || c.DrainHardTimeout < 0 {
+		return errors.New("drain timeouts must be >= 0")
 	}
-	u.Host, u.Port = host, port
-	return u, nil
+	switch c.Backpressure {
+	case BackpressureReject, BackpressureWait, BackpressureDropOldest, BackpressureDropLowestPriority:
+	default:
+		return fmt.Errorf("unknown backpressure strategy %q", c.Backpressure)
+	}
+	switch c.HashKey {
+	case HashClientIP, HashDestination, HashDestHost:
+	default:
+		return fmt.Errorf("unknown hash_key %q", c.HashKey)
+	}
+	if c.OTel.Enabled && c.OTel.Endpoint == "" {
+		return errors.New("otel.enabled=true requires otel.endpoint")
+	}
+	if c.OTel.SampleRatio < 0 || c.OTel.SampleRatio > 1 {
+		return errors.New("otel.sample_ratio must be in [0,1]")
+	}
+	return nil
 }
 
-func applyURLParams(u *upstream.Upstream, q url.Values) {
-	if v := q.Get("weight"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			u.Weight = n
+// BuildUpstreams converts file-specified UpstreamSpecs into Upstream objects.
+func (c *Config) BuildUpstreams() ([]*upstream.Upstream, error) {
+	out := make([]*upstream.Upstream, 0, len(c.Upstreams))
+	for i, s := range c.Upstreams {
+		if s.Host == "" || s.Port <= 0 {
+			return nil, fmt.Errorf("upstream[%d]: host and port required", i)
 		}
+		w := s.Weight
+		if w <= 0 {
+			w = 1
+		}
+		u := upstream.New(s.Host, s.Port, s.Username, s.Password, w, s.Priority)
+		if s.ID != "" {
+			u.ID = s.ID
+		}
+		out = append(out, u)
 	}
-	if v := q.Get("priority"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			u.Priority = n
-		}
-	}
-}
-
-func applyShorthandParams(u *upstream.Upstream, s string) {
-	for _, kv := range strings.Split(s, ",") {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		switch key {
-		case "w", "weight":
-			if n, err := strconv.Atoi(val); err == nil && n > 0 {
-				u.Weight = n
-			}
-		case "p", "priority":
-			if n, err := strconv.Atoi(val); err == nil {
-				u.Priority = n
-			}
-		}
-	}
+	return out, nil
 }

@@ -1,17 +1,20 @@
-// Package balancer wires upstream selection, queueing, health, and session
-// handling together behind a single Serve/Shutdown surface.
+// Package balancer wires upstream selection, admission, queueing, health,
+// and session handling together behind a single Serve/Shutdown/Reload surface.
 package balancer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	mathrand "math/rand"
 	"net"
 	"sort"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/khodaparastan/socks5lb/internal/admission"
 	"github.com/khodaparastan/socks5lb/internal/config"
 	"github.com/khodaparastan/socks5lb/internal/metrics"
 	"github.com/khodaparastan/socks5lb/internal/socks5"
@@ -19,20 +22,32 @@ import (
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
-// LoadBalancer is the core proxy engine.
+// LoadBalancer is the proxy engine.
 type LoadBalancer struct {
-	cfg      config.Config
-	log      *slog.Logger
-	metrics  *metrics.Metrics
+	log     *slog.Logger
+	metrics *metrics.Metrics
+	tracer  trace.Tracer
+
+	// Config is atomically swapped on reload. Readers take cfgMu.RLock().
+	cfgMu sync.RWMutex
+	cfg   config.Config
+
 	selector strategy.Selector
 
+	// Upstream pool is swapped on reload. Readers take poolMu.RLock().
+	poolMu    sync.RWMutex
 	upstreams []*upstream.Upstream
+	byID      map[string]*upstream.Upstream
 
-	mu    sync.Mutex
+	// Queue state (FIFO waiters).
+	qmu   sync.Mutex
 	queue []*waiter
 
-	admission chan struct{}
+	// Admission gate + session tracker.
+	tracker *admission.Tracker
+	gate    admission.Gate
 
+	// Active conn tracking for forced shutdown.
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
 
@@ -40,46 +55,68 @@ type LoadBalancer struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	rng *mathrand.Rand
+	// configPath is remembered for SIGHUP reload.
+	configPath string
 }
 
-// waiter is a queued request awaiting an upstream slot. Carries the
-// SelectCtx so dispatch honors affinity for hash-based strategies.
+// waiter is a queued request waiting for an upstream slot.
 type waiter struct {
 	ticket chan *upstream.Upstream
 	sc     strategy.SelectCtx
 }
 
-// New builds a LoadBalancer. The upstream slice is sorted by Priority so that
-// priority-failover works without additional state.
-func New(cfg config.Config, log *slog.Logger, m *metrics.Metrics,
-	upstreams []*upstream.Upstream, sel strategy.Selector) *LoadBalancer {
-
-	sort.SliceStable(upstreams, func(i, j int) bool {
-		return upstreams[i].Priority < upstreams[j].Priority
-	})
-
+// New constructs a LoadBalancer.
+func New(
+	cfg config.Config,
+	configPath string,
+	log *slog.Logger,
+	m *metrics.Metrics,
+	tracer trace.Tracer,
+	ups []*upstream.Upstream,
+	sel strategy.Selector,
+) *LoadBalancer {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	tracker := admission.NewTracker()
+	gate := admission.New(cfg, log, tracker)
+
 	lb := &LoadBalancer{
-		cfg:       cfg,
-		log:       log,
-		metrics:   m,
-		selector:  sel,
-		upstreams: upstreams,
-		admission: make(chan struct{}, cfg.MaxClients),
-		conns:     make(map[net.Conn]struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
-		rng:       mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		log:        log,
+		metrics:    m,
+		tracer:     tracer,
+		cfg:        cfg,
+		configPath: configPath,
+		selector:   sel,
+		tracker:    tracker,
+		gate:       gate,
+		conns:      make(map[net.Conn]struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
+	lb.setUpstreams(ups)
 
-	for _, u := range upstreams {
-		m.UpActive.WithLabelValues(u.Addr()).Set(0)
-		m.UpHealthy.WithLabelValues(u.Addr()).Set(boolToFloat(u.Healthy))
-	}
 	m.StrategyInfo.WithLabelValues(sel.Name()).Set(1)
-
+	m.BackpressureInfo.WithLabelValues(string(cfg.Backpressure)).Set(1)
 	return lb
+}
+
+// setUpstreams atomically replaces the pool. Called from New and Reload.
+func (lb *LoadBalancer) setUpstreams(ups []*upstream.Upstream) {
+	// Sort by priority ascending for priority-failover compatibility.
+	sort.SliceStable(ups, func(i, j int) bool {
+		return ups[i].Priority < ups[j].Priority
+	})
+	idx := make(map[string]*upstream.Upstream, len(ups))
+	for _, u := range ups {
+		u.NormalizeID()
+		idx[u.ID] = u
+		lb.metrics.UpActive.WithLabelValues(u.Addr()).Set(float64(u.State.Active()))
+		lb.metrics.UpHealthy.WithLabelValues(u.Addr()).Set(boolToFloat(u.State.Healthy()))
+	}
+	lb.poolMu.Lock()
+	lb.upstreams = ups
+	lb.byID = idx
+	lb.poolMu.Unlock()
 }
 
 func boolToFloat(b bool) float64 {
@@ -89,20 +126,28 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
+// Config returns a snapshot of the current config.
+func (lb *LoadBalancer) Config() config.Config {
+	lb.cfgMu.RLock()
+	defer lb.cfgMu.RUnlock()
+	return lb.cfg
+}
+
+// --- admin.ReadinessProber --------------------------------------------------
+
 // AnyHealthy reports whether at least one upstream is currently healthy.
-// Implements admin.ReadinessProber.
 func (lb *LoadBalancer) AnyHealthy() bool {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
+	lb.poolMu.RLock()
+	defer lb.poolMu.RUnlock()
 	for _, u := range lb.upstreams {
-		if u.Healthy {
+		if u.State.Healthy() {
 			return true
 		}
 	}
 	return false
 }
 
-// --- Conn tracking (for forced shutdown close) ------------------------------
+// --- conn tracking ----------------------------------------------------------
 
 func (lb *LoadBalancer) track(c net.Conn) {
 	lb.connsMu.Lock()
@@ -124,61 +169,84 @@ func (lb *LoadBalancer) closeAllConns() int {
 	return n
 }
 
-// --- Accept loop ------------------------------------------------------------
+// --- accept loop ------------------------------------------------------------
 
-// Serve binds the listener and begins accepting clients.  Returns nil on
-// graceful shutdown.
+// Serve binds the frontend listener and accepts clients until context cancel.
+// Returns nil on graceful shutdown, or a bind error if the listener fails.
 func (lb *LoadBalancer) Serve() error {
+	cfg := lb.Config()
+
 	lc := net.ListenConfig{}
-	listener, err := lc.Listen(lb.ctx, "tcp", lb.cfg.ListenAddr)
+	listener, err := lc.Listen(lb.ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("bind %s: %w", lb.cfg.ListenAddr, err)
+		return fmt.Errorf("bind %s: %w", cfg.ListenAddr, err)
 	}
 	lb.log.Info("listening",
-		"addr", lb.cfg.ListenAddr,
+		"addr", cfg.ListenAddr,
 		"upstreams", len(lb.upstreams),
 		"strategy", lb.selector.Name(),
-		"max_per_proxy", lb.cfg.MaxPerProxy,
-		"max_clients", lb.cfg.MaxClients,
+		"backpressure", string(cfg.Backpressure),
+		"udp_enabled", cfg.UDPEnabled,
 	)
 
 	lb.wg.Add(1)
 	go func() { defer lb.wg.Done(); lb.healthLoop() }()
 
-	go func() { <-lb.ctx.Done(); _ = listener.Close() }()
+	// Listener closer on ctx cancel.
+	go func() {
+		<-lb.ctx.Done()
+		_ = listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if lb.ctx.Err() != nil {
+			if lb.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() { //nolint:staticcheck
-				lb.log.Warn("accept_temporary", "err", err.Error())
-				time.Sleep(100 * time.Millisecond)
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				lb.log.Warn("accept_timeout", "err", err.Error())
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-			return err
+			lb.log.Warn("accept_error", "err", err.Error())
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		lb.metrics.AcceptedTotal.Inc()
 
-		select {
-		case lb.admission <- struct{}{}:
-			lb.metrics.AdmissionInFly.Set(float64(len(lb.admission)))
+		// Admission gate.
+		dec := lb.gate.Acquire(lb.ctx)
+		lb.metrics.AdmissionInFly.Set(float64(lb.gate.InFlight()))
+		switch dec.Outcome {
+		case admission.Admitted, admission.Evicted:
+			if dec.Outcome == admission.Evicted {
+				lb.metrics.BackpressureEvict.Inc()
+			}
+			sess := &admission.Session{
+				Conn:       conn,
+				AdmittedAt: time.Now(),
+			}
+			lb.tracker.Add(sess)
+
 			lb.wg.Add(1)
 			go func() {
 				defer lb.wg.Done()
 				defer func() {
-					<-lb.admission
-					lb.metrics.AdmissionInFly.Set(float64(len(lb.admission)))
+					lb.tracker.Release(sess)
+					lb.gate.Release()
+					lb.metrics.AdmissionInFly.Set(float64(lb.gate.InFlight()))
 				}()
-				lb.handleClient(conn)
+				lb.handleClient(conn, sess)
 			}()
-		default:
-			lb.metrics.RejectedTotal.WithLabelValues("admission_full").Inc()
-			lb.log.Warn("rejected_admission_full",
+
+		case admission.Rejected:
+			lb.metrics.RejectedTotal.WithLabelValues(dec.Reason).Inc()
+			lb.log.Warn("rejected",
+				"reason", dec.Reason,
 				"remote", conn.RemoteAddr().String(),
-				"cap", lb.cfg.MaxClients)
+			)
 			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = conn.Write(socks5.ReplyBytes(socks5.RepGeneralFailure))
 			_ = conn.Close()
@@ -186,22 +254,59 @@ func (lb *LoadBalancer) Serve() error {
 	}
 }
 
-// Shutdown cancels the context, waits for drain up to DrainTimeout, then
-// force-closes anything still in flight.
+// --- shutdown ---------------------------------------------------------------
+
+// Shutdown performs a two-phase drain:
+//
+//  1. Cancel ctx -> listener closes, health loop stops, no new admissions.
+//     Wait up to DrainSoftTimeout for in-flight sessions to finish naturally.
+//  2. Force-close all tracked conns. Wait up to DrainHardTimeout for
+//     goroutines to exit.
 func (lb *LoadBalancer) Shutdown() {
-	lb.log.Info("shutdown_begin", "drain_timeout", lb.cfg.DrainTimeout.String())
+	cfg := lb.Config()
+	lb.log.Info("shutdown_begin",
+		"drain_soft", cfg.DrainSoftTimeout.String(),
+		"drain_hard", cfg.DrainHardTimeout.String(),
+	)
 	lb.cancel()
 
 	done := make(chan struct{})
 	go func() { lb.wg.Wait(); close(done) }()
 
+	// Phase 1.
 	select {
 	case <-done:
-		lb.log.Info("shutdown_drained")
-	case <-time.After(lb.cfg.DrainTimeout):
-		n := lb.closeAllConns()
-		lb.log.Warn("shutdown_force_closed", "connections", n)
-		<-done
-		lb.log.Info("shutdown_complete")
+		lb.log.Info("shutdown_drained_softly")
+		return
+	case <-time.After(cfg.DrainSoftTimeout):
 	}
+
+	// Phase 2.
+	n := lb.closeAllConns()
+	lb.log.Warn("shutdown_force_closing", "connections", n)
+
+	select {
+	case <-done:
+		lb.log.Info("shutdown_complete")
+	case <-time.After(cfg.DrainHardTimeout):
+		lb.log.Error("shutdown_hard_timeout_exceeded",
+			"remaining", lb.tracker.Count(),
+		)
+	}
+}
+
+// --- internal helpers available to session code -----------------------------
+
+// currentPool returns a snapshot slice suitable for selectors.
+func (lb *LoadBalancer) currentPool() ([]upstream.Snapshot, map[string]*upstream.Upstream) {
+	lb.poolMu.RLock()
+	pool := lb.upstreams
+	idx := lb.byID
+	lb.poolMu.RUnlock()
+
+	snaps := make([]upstream.Snapshot, 0, len(pool))
+	for _, u := range pool {
+		snaps = append(snaps, u.Snapshot())
+	}
+	return snaps, idx
 }

@@ -5,16 +5,15 @@ import (
 	"strings"
 )
 
-// New builds the selector identified by `name`.  `poolSize` is required by
-// strategies that pre-allocate per-upstream state (e.g. WRR).
-func New(name string, poolSize int) (Selector, error) {
+// New builds a Selector by name. Unknown names return a descriptive error.
+func New(name string) (Selector, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "least-active", "leastconn":
 		return NewLeastActive(), nil
 	case "round-robin", "rr":
 		return NewRoundRobin(), nil
 	case "weighted-round-robin", "wrr":
-		return NewWRR(poolSize), nil
+		return NewWRR(), nil
 	case "random":
 		return NewRandom(), nil
 	case "weighted-random", "wrandom":
@@ -32,11 +31,17 @@ func New(name string, poolSize int) (Selector, error) {
 	}
 }
 
-// Names lists all registered strategy names.
+// Names returns all registered strategy canonical names.
 func Names() []string {
 	return []string{
-		"least-active", "round-robin", "weighted-round-robin",
-		"random", "weighted-random", "p2c", "least-latency",
-		"consistent-hash", "priority-failover",
+		"least-active",
+		"round-robin",
+		"weighted-round-robin",
+		"random",
+		"weighted-random",
+		"p2c",
+		"least-latency",
+		"consistent-hash",
+		"priority-failover",
 	}
 }

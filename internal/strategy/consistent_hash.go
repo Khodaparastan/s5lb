@@ -7,34 +7,33 @@ import (
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
-// ConsistentHashSelector uses Rendezvous (HRW) hashing.  For a stable key,
-// upstream order is deterministic; on failure the next-highest ranked
-// eligible upstream is selected.  Provides session affinity without a ring.
+// ConsistentHashSelector uses Rendezvous (HRW) hashing for session affinity.
+// On failure of the top-ranked upstream, falls through to the next highest.
 type ConsistentHashSelector struct{}
 
 func NewConsistentHash() *ConsistentHashSelector { return &ConsistentHashSelector{} }
 func (s *ConsistentHashSelector) Name() string   { return "consistent-hash" }
 
-func (s *ConsistentHashSelector) Pick(sc SelectCtx, pool []*upstream.Upstream, max int) *upstream.Upstream {
+func (s *ConsistentHashSelector) Pick(sc SelectCtx, pool []upstream.Snapshot, maxPer int) string {
 	if len(pool) == 0 {
-		return nil
+		return ""
 	}
 	key := sc.HashInput()
 	type rank struct {
-		u *upstream.Upstream
+		u upstream.Snapshot
 		h uint64
 	}
 	ranks := make([]rank, 0, len(pool))
 	for _, u := range pool {
-		ranks = append(ranks, rank{u, hrw(key, u.Addr())})
+		ranks = append(ranks, rank{u, hrw(key, u.ID)})
 	}
 	sort.Slice(ranks, func(i, j int) bool { return ranks[i].h > ranks[j].h })
 	for _, r := range ranks {
-		if r.u.Healthy && r.u.Active < max {
-			return r.u
+		if r.u.Healthy && r.u.Active < maxPer {
+			return r.u.ID
 		}
 	}
-	return nil
+	return ""
 }
 
 func hrw(key, target string) uint64 {

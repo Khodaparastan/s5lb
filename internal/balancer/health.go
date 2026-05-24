@@ -2,20 +2,14 @@ package balancer
 
 import (
 	"context"
-	"net"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/khodaparastan/socks5lb/internal/socks5"
+	"github.com/khodaparastan/socks5lb/internal/transport"
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
-
-// markUnhealthy performs the state transition and emits the metric/log.
-func (lb *LoadBalancer) markUnhealthy(u *upstream.Upstream, reason string) {
-	if u.State.MarkUnhealthy() {
-		lb.metrics.UpHealthy.WithLabelValues(u.Addr()).Set(0)
-		lb.log.Warn("upstream_unhealthy", "upstream", u.Addr(), "reason", reason)
-	}
-}
 
 // markHealthy performs the state transition and dispatches any queued waiters.
 func (lb *LoadBalancer) markHealthy(u *upstream.Upstream) {
@@ -67,7 +61,14 @@ func (lb *LoadBalancer) probe(u *upstream.Upstream) error {
 	ctx, cancel := context.WithTimeout(lb.ctx, cfg.ConnectTimeout)
 	defer cancel()
 
-	d := net.Dialer{Timeout: cfg.ConnectTimeout}
+	d := lb.Dialer()
+	if d == nil {
+		d = transport.TCPDialer{
+			Timeout:   cfg.ConnectTimeout,
+			KeepAlive: 30 * time.Second,
+		}
+	}
+
 	conn, err := d.DialContext(ctx, "tcp", u.Addr())
 	if err != nil {
 		result = "dial_err"
@@ -104,19 +105,46 @@ func (lb *LoadBalancer) runHealthChecks() {
 	pool := append([]*upstream.Upstream(nil), lb.upstreams...)
 	lb.poolMu.RUnlock()
 
-	for _, u := range pool {
-		if !u.State.Healthy() && time.Since(u.State.LastFailure()) < cfg.RetryBackoff {
-			continue
-		}
-		err := lb.probe(u)
-		if err == nil {
-			u.State.RecordSuccess()
-			lb.markHealthy(u)
-			lb.log.Debug("probe_ok", "upstream", u.Addr())
-		} else {
-			lb.recordFailure(u, "probe", err.Error())
-		}
-		// Refresh EWMA gauge regardless.
-		lb.metrics.UpLatencyEWMA.WithLabelValues(u.Addr()).Set(u.EWMALatency())
+	if len(pool) == 0 {
+		return
 	}
+
+	// Bounded worker pool: at most min(len(pool), GOMAXPROCS*2) concurrent probes.
+	workers := runtime.GOMAXPROCS(0) * 2
+	if workers > len(pool) {
+		workers = len(pool)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	work := make(chan *upstream.Upstream, len(pool))
+	for _, u := range pool {
+		work <- u
+	}
+	close(work)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for u := range work {
+				if !u.State.Healthy() && time.Since(u.State.LastFailure()) < cfg.RetryBackoff {
+					continue
+				}
+				err := lb.probe(u)
+				if err == nil {
+					u.State.RecordSuccess()
+					lb.markHealthy(u)
+					lb.log.Debug("probe_ok", "upstream", u.Addr())
+				} else {
+					lb.recordFailure(u, "probe", err.Error())
+				}
+				// Refresh EWMA gauge regardless.
+				lb.metrics.UpLatencyEWMA.WithLabelValues(u.Addr()).Set(u.EWMALatency())
+			}
+		}()
+	}
+	wg.Wait()
 }

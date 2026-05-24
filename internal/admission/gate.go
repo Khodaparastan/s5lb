@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -152,21 +153,38 @@ type evictGate struct {
 	*tokenGate
 	tracker    *Tracker
 	pickOldest bool
+	evictMu    sync.Mutex // serializes concurrent eviction attempts
 }
 
 func (g *evictGate) Acquire(ctx context.Context) Decision {
 	if g.tryAcquire() {
 		return Decision{Outcome: Admitted}
 	}
-	// Evict a victim; its session goroutine will Release its slot as it
-	// unwinds. Then wait briefly for that slot to become free.
-	var victim *Session
-	if g.pickOldest {
-		victim = g.tracker.PickOldest()
-	} else {
-		victim = g.tracker.PickLowestPriority()
+
+	// Guard against nil tracker (misconfiguration).
+	if g.tracker == nil {
+		g.log.Error("evict_gate_nil_tracker")
+		if g.waitAcquire(ctx, g.waitTO) {
+			return Decision{Outcome: Admitted}
+		}
+		return Decision{Outcome: Rejected, Reason: "evict_no_tracker"}
 	}
-	if victim == nil {
+
+	// Serialize victim selection + close so concurrent Acquire calls never
+	// pick and close the same session twice.
+	g.evictMu.Lock()
+	var (
+		victim Victim
+		ok     bool
+	)
+	if g.pickOldest {
+		victim, ok = g.tracker.PickOldestVictim()
+	} else {
+		victim, ok = g.tracker.PickLowestPriorityVictim()
+	}
+	g.evictMu.Unlock()
+
+	if !ok {
 		// Tracker is empty but gate is full — means in-flight sessions
 		// aren't yet tracked (race during startup). Fall back to wait.
 		if g.waitAcquire(ctx, g.waitTO) {
@@ -179,6 +197,7 @@ func (g *evictGate) Acquire(ctx context.Context) Decision {
 		"victim_admitted", victim.AdmittedAt.Format(time.RFC3339),
 		"victim_prio", victim.UpstreamPrio,
 	)
+	// Close the victim outside the lock so it doesn't stall other evictions.
 	_ = victim.Conn.Close()
 
 	if g.waitAcquire(ctx, g.waitTO) {

@@ -42,6 +42,8 @@ func NewTracker() *Tracker { return &Tracker{} }
 func (t *Tracker) Add(s *Session) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// Reset released state in case this session is being re-added.
+	s.released = false
 	s.prev = t.tail
 	s.next = nil
 	if t.tail != nil {
@@ -58,6 +60,11 @@ func (t *Tracker) Release(s *Session) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if s.released {
+		return
+	}
+	// Guard against releasing a session that was never added (count would go negative).
+	if t.count <= 0 {
+		s.released = true
 		return
 	}
 	s.released = true
@@ -90,22 +97,75 @@ func (t *Tracker) Count() int {
 	return t.count
 }
 
-// PickOldest returns the oldest live session or nil.
-// Returned session is still in the list; caller must Close its Conn.
-func (t *Tracker) PickOldest() *Session {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.head
+// SessionSnapshot is a point-in-time view of a tracked session.
+type SessionSnapshot struct {
+	ClientAddr   string
+	UpstreamID   string
+	UpstreamPrio int
+	AdmittedAt   time.Time
 }
 
-// PickLowestPriority returns the oldest session whose UpstreamPrio is the
-// numerically highest value (== lowest priority, since lower Priority = higher
-// importance). Falls back to oldest if no session has an assignment yet.
-func (t *Tracker) PickLowestPriority() *Session {
+// Sessions returns a snapshot of all currently tracked sessions, oldest first.
+func (t *Tracker) Sessions() []SessionSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]SessionSnapshot, 0, t.count)
+	for s := t.head; s != nil; s = s.next {
+		addr := ""
+		if s.Conn != nil {
+			if ra := s.Conn.RemoteAddr(); ra != nil {
+				addr = ra.String()
+			}
+		}
+		out = append(out, SessionSnapshot{
+			ClientAddr:   addr,
+			UpstreamID:   s.UpstreamID,
+			UpstreamPrio: s.UpstreamPrio,
+			AdmittedAt:   s.AdmittedAt,
+		})
+	}
+	return out
+}
+
+// Victim is an immutable snapshot of a session selected for eviction.
+// All fields are copied while holding Tracker.mu, so they are safe to use
+// without any lock after the call returns.
+type Victim struct {
+	Conn         net.Conn
+	UpstreamID   string
+	UpstreamPrio int
+	AdmittedAt   time.Time
+}
+
+func victimFromSession(s *Session) Victim {
+	return Victim{
+		Conn:         s.Conn,
+		UpstreamID:   s.UpstreamID,
+		UpstreamPrio: s.UpstreamPrio,
+		AdmittedAt:   s.AdmittedAt,
+	}
+}
+
+// PickOldestVictim returns an immutable snapshot of the oldest live session.
+// Returns (Victim{}, false) when there are no sessions.
+func (t *Tracker) PickOldestVictim() (Victim, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.head == nil {
-		return nil
+		return Victim{}, false
+	}
+	return victimFromSession(t.head), true
+}
+
+// PickLowestPriorityVictim returns a snapshot of the session whose UpstreamPrio
+// is the numerically highest (== lowest importance). Falls back to oldest when
+// no session has an upstream assignment yet.
+// Returns (Victim{}, false) when there are no sessions.
+func (t *Tracker) PickLowestPriorityVictim() (Victim, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.head == nil {
+		return Victim{}, false
 	}
 	var worst *Session
 	for s := t.head; s != nil; s = s.next {
@@ -117,7 +177,7 @@ func (t *Tracker) PickLowestPriority() *Session {
 		}
 	}
 	if worst == nil {
-		return t.head
+		worst = t.head
 	}
-	return worst
+	return victimFromSession(worst), true
 }

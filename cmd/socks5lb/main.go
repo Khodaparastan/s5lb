@@ -1,6 +1,6 @@
 // Command socks5lb is a SOCKS5 load-balancing proxy with pluggable strategies,
 // configurable backpressure, UDP ASSOCIATE, OpenTelemetry tracing, Prometheus
-// metrics, two-phase graceful drain, and SIGHUP hot reload.
+// metrics, two-phase graceful drain, SIGHUP hot reload, and multi-group support.
 package main
 
 import (
@@ -23,7 +23,6 @@ import (
 	"github.com/khodaparastan/socks5lb/internal/metrics"
 	"github.com/khodaparastan/socks5lb/internal/strategy"
 	"github.com/khodaparastan/socks5lb/internal/telemetry"
-	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
 // Build stamps (ldflags).
@@ -81,102 +80,134 @@ func main() {
 		return
 	}
 
-	// --- Load config ---
-	var cfg config.Config
+	// --- Load multi-group config ---
+	var mc config.MultiConfig
 	if *configPath != "" {
-		loaded, err := config.LoadFile(*configPath)
+		loaded, err := config.LoadMultiFile(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
 			os.Exit(2)
 		}
-		cfg = loaded
+		mc = loaded
 	} else {
-		cfg = config.Defaults()
+		mc = config.MultiConfig{Config: config.Defaults()}
 	}
 
-	// Flag overrides.
-	applyFlagOverrides(&cfg,
+	// Track which flags were explicitly set by the user.
+	seenFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { seenFlags[f.Name] = true })
+
+	// Apply flag overrides to the embedded (global/default) Config.
+	applyFlagOverrides(&mc.Config,
+		seenFlags,
 		*listen, *admAddr, *strategyFlag, *hashKeyFlag, *backpressureFlag,
 		*maxPerProxy, *maxClients, *logLevel, *logFormat,
 		*udpEnabled, *otelEnabled, *otelEndpoint, *otelInsecure,
 	)
 
-	// Merge flag upstreams into config upstreams.
-	upstreams, err := cfg.BuildUpstreams()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error building upstreams from config: %v\n", err)
-		os.Exit(2)
-	}
+	// Merge CLI-supplied upstreams into the global config (used as default for
+	// single-group mode or as a fallback for groups that don't define upstreams).
 	for _, spec := range upstreamsFlag {
 		u, err := config.ParseUpstream(spec)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "invalid upstream %q: %v\n", spec, err)
 			os.Exit(2)
 		}
-		upstreams = append(upstreams, u)
-	}
-	if len(upstreams) == 0 {
-		fmt.Fprintln(os.Stderr, "error: at least one upstream is required (config or -upstream)")
-		flag.Usage()
-		os.Exit(2)
+		mc.Config.Upstreams = append(mc.Config.Upstreams, config.UpstreamSpec{
+			Host:     u.Host,
+			Port:     u.Port,
+			Username: u.Username,
+			Password: u.Password,
+			Weight:   u.Weight,
+			Priority: u.Priority,
+		})
 	}
 
-	if err := cfg.Validate(); err != nil {
+	// Ensure at least one group has upstreams.
+	effs := mc.EffectiveGroups()
+	for _, eff := range effs {
+		if len(eff.Upstreams) == 0 {
+			fmt.Fprintln(os.Stderr, "error: at least one upstream is required (config or -upstream)")
+			flag.Usage()
+			os.Exit(2)
+		}
+	}
+
+	if err := mc.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid config: %v\n", err)
 		os.Exit(2)
 	}
 
 	// --- Logger ---
-	log := logging.New(cfg.LogLevel, cfg.LogFormat, "socks5lb", version)
+	log := logging.New(mc.Config.LogLevel, mc.Config.LogFormat, "socks5lb", version)
 	log.Info("starting",
 		"version", version, "commit", commit, "build_date", buildDate,
-		"strategy", cfg.Strategy, "backpressure", string(cfg.Backpressure),
-		"udp_enabled", cfg.UDPEnabled, "otel_enabled", cfg.OTel.Enabled,
+		"groups", len(effs),
+		"otel_enabled", mc.Config.OTel.Enabled,
 	)
-
-	// --- Strategy ---
-	sel, err := strategy.New(cfg.Strategy)
-	if err != nil {
-		log.Error("invalid_strategy", "err", err.Error())
-		os.Exit(2)
-	}
 
 	// --- Metrics ---
 	reg := prometheus.NewRegistry()
-	metrics.RegisterRuntime(reg)
-	m := metrics.New(reg, version, commit, buildDate)
+	if err := metrics.RegisterRuntime(reg); err != nil {
+		fmt.Fprintf(os.Stderr, "metrics runtime registration failed: %v\n", err)
+		os.Exit(2)
+	}
+	if err := metrics.RegisterBuildInfo(reg, version, commit, buildDate); err != nil {
+		fmt.Fprintf(os.Stderr, "metrics build_info registration failed: %v\n", err)
+		os.Exit(2)
+	}
 
 	// --- OTel ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	prov, err := telemetry.Init(ctx, cfg.OTel, version, commit)
+	prov, err := telemetry.Init(ctx, mc.Config.OTel, version, commit)
 	if err != nil {
 		log.Error("otel_init_failed", "err", err.Error())
 		os.Exit(2)
 	}
 	defer func() {
 		sctx, cc := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = prov.Shutdown(sctx)
-		cc()
+		defer cc()
+		if err := prov.Shutdown(sctx); err != nil {
+			log.Error("otel_shutdown_failed", "err", err.Error())
+		}
 	}()
 
-	// --- Balancer ---
-	lb := balancer.New(cfg, *configPath, log, m, prov.Tracer, upstreams, sel)
+	// --- Manager ---
+	mgr, err := balancer.NewManager(mc, *configPath, log, reg, prov.Tracer, version, commit, buildDate)
+	if err != nil {
+		log.Error("manager_init_failed", "err", err.Error())
+		os.Exit(2)
+	}
 
 	// --- Admin ---
 	var adm *admin.Server
-	if cfg.AdminAddr != "" {
-		adm = admin.New(cfg.AdminAddr, lb, lb, reg, log, version, commit, buildDate)
+	if mc.Config.AdminAddr != "" {
+		adm, err = admin.New(mc.Config.AdminAddr, mgr, mgr, reg, log, version, commit, buildDate,
+			admin.Options{
+				BearerToken:      mc.Config.AdminToken,
+				EnablePprof:      mc.Config.AdminPprof,
+				GroupProvider:    mgr,
+				GroupReloader:    mgr,
+				StateProvider:    mgr,
+				SessionsProvider: mgr,
+				DrainController:  mgr,
+			})
+		if err != nil {
+			log.Error("admin_init_failed", "err", err.Error())
+			os.Exit(2)
+		}
 		adm.Start()
 	}
 
 	// --- Signals / lifecycle ---
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- lb.Serve() }()
+	go func() { serveErr <- mgr.Start(ctx) }()
 
 	for {
 		select {
@@ -184,13 +215,13 @@ func main() {
 			switch sig {
 			case syscall.SIGHUP:
 				log.Info("signal_received_reload")
-				if err := lb.Reload(); err != nil {
+				if err := mgr.Reload(); err != nil {
 					log.Error("reload_failed", "err", err.Error())
 				}
 				continue
 			default:
 				log.Info("signal_received", "signal", sig.String())
-				lb.Shutdown()
+				mgr.Shutdown()
 				if adm != nil {
 					sctx, cc := context.WithTimeout(context.Background(), 5*time.Second)
 					adm.Stop(sctx)
@@ -210,14 +241,14 @@ func main() {
 			return
 		}
 	}
-
-	// unreachable
-	_ = upstream.Upstream{}
 }
 
 // applyFlagOverrides merges non-zero flag values over cfg.
+// seen tracks which flags were explicitly provided by the user; boolean
+// overrides are only applied when the corresponding flag was seen.
 func applyFlagOverrides(
 	cfg *config.Config,
+	seen map[string]bool,
 	listen, admAddr, strat, hashKey, backpressure string,
 	maxPer, maxCli int,
 	logLevel, logFormat string,
@@ -251,17 +282,17 @@ func applyFlagOverrides(
 	if logFormat != "" {
 		cfg.LogFormat = logFormat
 	}
-	cfg.UDPEnabled = udpEnabled
-	if otelEnabled {
-		cfg.OTel.Enabled = true
+	if seen["udp"] {
+		cfg.UDPEnabled = udpEnabled
+	}
+	if seen["otel"] {
+		cfg.OTel.Enabled = otelEnabled
 	}
 	if otelEndpoint != "" {
 		cfg.OTel.Endpoint = otelEndpoint
 		cfg.OTel.Enabled = true
 	}
-	if !otelInsecure {
-		cfg.OTel.Insecure = false
-	} else {
-		cfg.OTel.Insecure = true
+	if seen["otel-insecure"] {
+		cfg.OTel.Insecure = otelInsecure
 	}
 }

@@ -7,14 +7,14 @@ import (
 	"net"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-
 	"github.com/khodaparastan/socks5lb/internal/admission"
 	"github.com/khodaparastan/socks5lb/internal/config"
 	"github.com/khodaparastan/socks5lb/internal/socks5"
 	"github.com/khodaparastan/socks5lb/internal/strategy"
+	"github.com/khodaparastan/socks5lb/internal/transport"
 	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // handleConnect implements CMD=CONNECT end-to-end.
@@ -130,7 +130,14 @@ func (lb *LoadBalancer) dialAndHandshakeUpstream(
 
 	_, dialSpan := lb.tracer.Start(ctx, "upstream.dial")
 	dialStart := time.Now()
-	d := net.Dialer{Timeout: cfg.ConnectTimeout}
+	d := lb.Dialer()
+	if d == nil {
+		d = transport.TCPDialer{
+			Timeout:   cfg.ConnectTimeout,
+			KeepAlive: 30 * time.Second,
+		}
+	}
+
 	c, err := d.DialContext(dCtx, "tcp", u.Addr())
 	dialDur := time.Since(dialStart)
 	lb.metrics.UpDialSec.WithLabelValues(u.Addr()).Observe(dialDur.Seconds())
@@ -154,7 +161,13 @@ func (lb *LoadBalancer) dialAndHandshakeUpstream(
 		hsDur := time.Since(hsStart)
 		lb.metrics.UpHandshake.WithLabelValues(u.Addr()).Observe(hsDur.Seconds())
 		lb.recordFailure(u, "handshake", err.Error())
-		log.Warn("upstream_handshake_failed", "err", err.Error(), "elapsed_ms", hsDur.Milliseconds())
+		log.Warn(
+			"upstream_handshake_failed",
+			"err",
+			err.Error(),
+			"elapsed_ms",
+			hsDur.Milliseconds(),
+		)
 		hsSpan.RecordError(err)
 		hsSpan.SetStatus(codes.Error, "handshake_failed")
 		hsSpan.End()

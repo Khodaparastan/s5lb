@@ -4,20 +4,26 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 
 	"github.com/khodaparastan/socks5lb/internal/admission"
 	"github.com/khodaparastan/socks5lb/internal/socks5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
+
+var sessionCounter atomic.Uint64
 
 func newSessionID() string {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fall back to monotonic counter on crypto/rand failure.
+		return fmt.Sprintf("fallback-%d", sessionCounter.Add(1))
+	}
 	return hex.EncodeToString(b[:])
 }
 
@@ -107,14 +113,16 @@ func (lb *LoadBalancer) handleClient(client net.Conn, sess *admission.Session) {
 	case socks5.CmdUDPAssociate:
 		if !cfg.UDPEnabled {
 			_, _ = client.Write(socks5.ReplyBytes(socks5.RepCommandNotSupported))
-			lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepCommandNotSupported)).Inc()
+			lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepCommandNotSupported)).
+				Inc()
 			log.Warn("udp_disabled")
 			return
 		}
 		lb.handleUDPAssociate(ctx, client, br, req, sess, log)
 	default:
 		_, _ = client.Write(socks5.ReplyBytes(socks5.RepCommandNotSupported))
-		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepCommandNotSupported)).Inc()
+		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepCommandNotSupported)).
+			Inc()
 	}
 }
 

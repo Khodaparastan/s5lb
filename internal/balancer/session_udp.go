@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -12,12 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-
 	"github.com/khodaparastan/socks5lb/internal/admission"
+	"github.com/khodaparastan/socks5lb/internal/config"
 	"github.com/khodaparastan/socks5lb/internal/socks5"
 	"github.com/khodaparastan/socks5lb/internal/strategy"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // pinnedClient holds the (IP, port) of the client we first saw a UDP datagram
@@ -32,6 +33,7 @@ func (p *pinnedClient) set(a *net.UDPAddr) {
 	p.addr = a
 	p.mu.Unlock()
 }
+
 func (p *pinnedClient) get() *net.UDPAddr {
 	p.mu.RLock()
 	a := p.addr
@@ -136,6 +138,14 @@ func (lb *LoadBalancer) handleUDPAssociate(
 		return
 	}
 
+	// Reject zero bind port — it means the upstream can't receive datagrams.
+	if upUDPAddr.Port == 0 {
+		_, _ = client.Write(socks5.ReplyBytes(socks5.RepGeneralFailure))
+		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepGeneralFailure)).Inc()
+		log.Warn("upstream_udp_zero_bind_port")
+		return
+	}
+
 	// Bind local UDP sockets.
 	bindHost := udpBindHost(cfg)
 	bindIP := net.ParseIP(bindHost)
@@ -151,7 +161,12 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	}
 	defer clientPC.Close()
 
-	upPC, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	// Select upstream local bind family to match the upstream address family.
+	upBindIP := net.IPv4zero
+	if upUDPAddr.IP != nil && upUDPAddr.IP.To4() == nil {
+		upBindIP = net.IPv6zero
+	}
+	upPC, err := net.ListenUDP("udp", &net.UDPAddr{IP: upBindIP, Port: 0})
 	if err != nil {
 		_, _ = client.Write(socks5.ReplyBytes(socks5.RepGeneralFailure))
 		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepGeneralFailure)).Inc()
@@ -160,9 +175,18 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	}
 	defer upPC.Close()
 
-	// Reply to client with our local UDP endpoint.
+	// Derive the advertised IP for the UDP reply.
 	localAddr := clientPC.LocalAddr().(*net.UDPAddr)
-	replyBytes := socks5.BuildReply(socks5.RepSuccess, localAddr.IP, uint16(localAddr.Port))
+	advertiseIP, err := udpAdvertiseIP(cfg, localAddr, client.LocalAddr())
+	if err != nil {
+		_, _ = client.Write(socks5.ReplyBytes(socks5.RepGeneralFailure))
+		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepGeneralFailure)).Inc()
+		log.Warn("udp_advertise_addr_unavailable", "err", err.Error(), "local_udp", localAddr.String())
+		return
+	}
+
+	// Reply to client with our local UDP endpoint using the advertised IP.
+	replyBytes := socks5.BuildReply(socks5.RepSuccess, advertiseIP, uint16(localAddr.Port))
 	if _, err := client.Write(replyBytes); err != nil {
 		log.Warn("udp_reply_write_failed", "err", err.Error())
 		return
@@ -170,6 +194,9 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepSuccess)).Inc()
 	lb.metrics.UDPAssocActive.Inc()
 	defer lb.metrics.UDPAssocActive.Dec()
+
+	// Restrict UDP datagrams to the same IP as the TCP control connection.
+	allowedClientIP := tcpRemoteIP(client.RemoteAddr())
 
 	log.Info("udp_session_start",
 		"local_udp", localAddr.String(),
@@ -191,38 +218,34 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	go func() {
 		defer wg.Done()
 		defer relayCancel()
-		lb.udpClientToUpstream(relayCtx, clientPC, upPC, upUDPAddr, pin, stats, log)
+		lb.udpClientToUpstream(relayCtx, clientPC, upPC, upUDPAddr, allowedClientIP, pin, stats, log)
 	}()
 
 	// upstream -> client
 	go func() {
 		defer wg.Done()
 		defer relayCancel()
-		lb.udpUpstreamToClient(relayCtx, upPC, clientPC, pin, stats, log)
+		lb.udpUpstreamToClient(relayCtx, upPC, clientPC, upUDPAddr, pin, stats, log)
 	}()
 
-	// TCP control conn watchdog: any read unblocks iff the control conn is
-	// closing. Per RFC the client SHOULD NOT send data on the control conn,
-	// so we treat *any* data or error as "session over".
+	// TCP control conn watchdog: block on a single Read instead of polling
+	// with a deadline. Per RFC 1928, SOCKS5 UDP clients normally keep the TCP
+	// control connection open but send no data on it. Any data, FIN, or RST
+	// means the client is closing the association.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer relayCancel()
 		buf := make([]byte, 1)
-		for {
-			select {
-			case <-relayCtx.Done():
-				return
-			default:
-			}
-			_ = client.SetReadDeadline(time.Now().Add(cfg.UDPIdleTimeout))
-			if _, err := client.Read(buf); err != nil {
-				return
-			}
+		// Block until the TCP conn closes, receives data, or is force-closed
+		// during teardown via client.SetReadDeadline(time.Now()).
+		if _, err := client.Read(buf); err != nil {
+			return
 		}
+		log.Debug("udp_control_connection_received_data_closing")
 	}()
 
-	// Wait for any path to end the session.
+	// Wait for any path to end the session, then unblock all readers.
 	<-relayCtx.Done()
 	_ = clientPC.SetDeadline(time.Now())
 	_ = upPC.SetDeadline(time.Now())
@@ -244,13 +267,57 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	)
 }
 
+// udpAdvertiseIP returns the IP address to advertise to the client in the
+// UDP_ASSOCIATE reply. Priority: explicit config > non-unspecified UDP bind IP
+// > non-unspecified TCP local IP. Returns an error if no concrete IP is found.
+func udpAdvertiseIP(cfg config.Config, udpLocal *net.UDPAddr, tcpLocal net.Addr) (net.IP, error) {
+	if cfg.UDPAdvertiseAddr != "" {
+		ip := net.ParseIP(cfg.UDPAdvertiseAddr)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid udp_advertise %q", cfg.UDPAdvertiseAddr)
+		}
+		return ip, nil
+	}
+
+	if udpLocal != nil && udpLocal.IP != nil && !udpLocal.IP.IsUnspecified() {
+		return udpLocal.IP, nil
+	}
+
+	if ta, ok := tcpLocal.(*net.TCPAddr); ok && ta.IP != nil && !ta.IP.IsUnspecified() {
+		return ta.IP, nil
+	}
+
+	if host, _, err := net.SplitHostPort(tcpLocal.String()); err == nil {
+		if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+			return ip, nil
+		}
+	}
+
+	return nil, errors.New("udp_advertise is required when UDP bind address is unspecified")
+}
+
+// tcpRemoteIP extracts the IP portion of a TCP remote address.
+func tcpRemoteIP(addr net.Addr) net.IP {
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		return ta.IP
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
+}
+
 // udpClientToUpstream reads from the client-facing UDP socket, validates the
 // SOCKS5 UDP header, pins the source on first packet, and forwards verbatim
-// onto the upstream relay endpoint.
+// onto the upstream relay endpoint. allowedClientIP restricts which source
+// addresses are accepted before the first pin is established; it should be
+// set to the TCP control connection's remote IP to prevent hijacking.
 func (lb *LoadBalancer) udpClientToUpstream(
 	ctx context.Context,
 	clientPC, upPC *net.UDPConn,
 	upUDPAddr *net.UDPAddr,
+	allowedClientIP net.IP,
 	pin *pinnedClient,
 	stats *udpStats,
 	log *slog.Logger,
@@ -275,6 +342,18 @@ func (lb *LoadBalancer) udpClientToUpstream(
 			}
 			log.Warn("udp_client_read_err", "err", err.Error())
 			return
+		}
+
+		// Reject datagrams from an IP that differs from the TCP client's IP.
+		// This prevents a same-network attacker from racing the real client
+		// to hijack the association before the source address is pinned.
+		if allowedClientIP != nil && !src.IP.Equal(allowedClientIP) {
+			lb.metrics.UDPDropped.WithLabelValues("foreign_client_ip").Inc()
+			log.Debug("udp_client_foreign_ip",
+				"src", src.String(),
+				"expected_ip", allowedClientIP.String(),
+			)
+			continue
 		}
 
 		// Enforce source pinning.
@@ -309,10 +388,12 @@ func (lb *LoadBalancer) udpClientToUpstream(
 
 // udpUpstreamToClient reads from the upstream UDP relay and forwards verbatim
 // to the pinned client address. Datagrams received before the client has sent
-// anything are dropped (no-pin).
+// anything are dropped (no-pin). Datagrams from any address other than the
+// expected upstream relay address are dropped and counted.
 func (lb *LoadBalancer) udpUpstreamToClient(
 	ctx context.Context,
 	upPC, clientPC *net.UDPConn,
+	upUDPAddr *net.UDPAddr,
 	pin *pinnedClient,
 	stats *udpStats,
 	log *slog.Logger,
@@ -325,7 +406,7 @@ func (lb *LoadBalancer) udpUpstreamToClient(
 			return
 		}
 		_ = upPC.SetReadDeadline(time.Now().Add(cfg.UDPIdleTimeout))
-		n, _, err := upPC.ReadFromUDP(buf)
+		n, src, err := upPC.ReadFromUDP(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 				return
@@ -337,6 +418,16 @@ func (lb *LoadBalancer) udpUpstreamToClient(
 			}
 			log.Warn("udp_upstream_read_err", "err", err.Error())
 			return
+		}
+
+		// Validate source address to prevent UDP spoofing from non-upstream hosts.
+		if src != nil && !udpAddrEqual(src, upUDPAddr) {
+			lb.metrics.UDPDropped.WithLabelValues("foreign_upstream_src").Inc()
+			log.Debug("udp_upstream_foreign_src",
+				"src", src.String(),
+				"expected", upUDPAddr.String(),
+			)
+			continue
 		}
 
 		dg, err := socks5.DecodeUDPDatagram(buf[:n])

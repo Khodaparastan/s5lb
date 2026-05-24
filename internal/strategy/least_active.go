@@ -14,22 +14,25 @@ func NewLeastActive() *LeastActiveSelector  { return &LeastActiveSelector{} }
 func (s *LeastActiveSelector) Name() string { return "least-active" }
 
 func (s *LeastActiveSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
-	cands := eligible(pool, maxPer)
-	if len(cands) == 0 {
-		return ""
-	}
-	best := []upstream.Snapshot{cands[0]}
-	for _, u := range cands[1:] {
-		switch {
-		case u.Active < best[0].Active:
-			best = best[:0]
-			best = append(best, u)
-		case u.Active == best[0].Active:
-			best = append(best, u)
+	bestID := ""
+	bestActive := -1
+	tieCount := 0
+
+	for _, u := range pool {
+		if !u.Healthy || u.Active >= maxPer {
+			continue
+		}
+		if bestID == "" || u.Active < bestActive {
+			bestID = u.ID
+			bestActive = u.Active
+			tieCount = 1
+		} else if u.Active == bestActive {
+			// Reservoir sampling: replace with probability 1/(tieCount+1).
+			tieCount++
+			if rand.IntN(tieCount) == 0 {
+				bestID = u.ID
+			}
 		}
 	}
-	if len(best) == 1 {
-		return best[0].ID
-	}
-	return best[rand.IntN(len(best))].ID
+	return bestID
 }

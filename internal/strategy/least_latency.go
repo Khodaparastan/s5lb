@@ -16,29 +16,31 @@ func NewLeastLatency() *LeastLatencySelector { return &LeastLatencySelector{} }
 func (s *LeastLatencySelector) Name() string { return "least-latency" }
 
 func (s *LeastLatencySelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer int) string {
-	cands := eligible(pool, maxPer)
-	if len(cands) == 0 {
-		return ""
-	}
-	var tied []upstream.Snapshot
+	bestID := ""
 	bestScore := math.MaxFloat64
-	for _, u := range cands {
+	tieCount := 0
+
+	for _, u := range pool {
+		if !u.Healthy || u.Active >= maxPer {
+			continue
+		}
 		lat := u.EWMALatency
 		if lat <= 0 {
 			lat = 1e-9
 		}
 		score := lat * float64(1+u.Active)
-		switch {
-		case score < bestScore:
+
+		if bestID == "" || score < bestScore {
+			bestID = u.ID
 			bestScore = score
-			tied = tied[:0]
-			tied = append(tied, u)
-		case score == bestScore:
-			tied = append(tied, u)
+			tieCount = 1
+		} else if score == bestScore {
+			// Reservoir sampling: replace with probability 1/(tieCount+1).
+			tieCount++
+			if rand.IntN(tieCount) == 0 {
+				bestID = u.ID
+			}
 		}
 	}
-	if len(tied) == 1 {
-		return tied[0].ID
-	}
-	return tied[rand.IntN(len(tied))].ID
+	return bestID
 }

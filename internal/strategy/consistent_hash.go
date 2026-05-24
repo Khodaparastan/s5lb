@@ -2,13 +2,13 @@ package strategy
 
 import (
 	"hash/fnv"
-	"sort"
 
 	"github.com/khodaparastan/socks5lb/internal/upstream"
 )
 
 // ConsistentHashSelector uses Rendezvous (HRW) hashing for session affinity.
 // On failure of the top-ranked upstream, falls through to the next highest.
+// Uses an allocation-free single-pass scan instead of sorting per pick.
 type ConsistentHashSelector struct{}
 
 func NewConsistentHash() *ConsistentHashSelector { return &ConsistentHashSelector{} }
@@ -19,21 +19,21 @@ func (s *ConsistentHashSelector) Pick(sc SelectCtx, pool []upstream.Snapshot, ma
 		return ""
 	}
 	key := sc.HashInput()
-	type rank struct {
-		u upstream.Snapshot
-		h uint64
-	}
-	ranks := make([]rank, 0, len(pool))
+
+	bestID := ""
+	var bestH uint64
+
 	for _, u := range pool {
-		ranks = append(ranks, rank{u, hrw(key, u.ID)})
-	}
-	sort.Slice(ranks, func(i, j int) bool { return ranks[i].h > ranks[j].h })
-	for _, r := range ranks {
-		if r.u.Healthy && r.u.Active < maxPer {
-			return r.u.ID
+		if !u.Healthy || u.Active >= maxPer {
+			continue
+		}
+		h := hrw(key, u.ID)
+		if bestID == "" || h > bestH {
+			bestID = u.ID
+			bestH = h
 		}
 	}
-	return ""
+	return bestID
 }
 
 func hrw(key, target string) uint64 {

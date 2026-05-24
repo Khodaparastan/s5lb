@@ -16,6 +16,7 @@ type State struct {
 
 	active              int
 	healthy             bool
+	draining            bool
 	lastFailureTS       time.Time
 	firstFailureTS      time.Time
 	consecutiveFailures int
@@ -44,6 +45,7 @@ type Snapshot struct {
 
 	Active              int
 	Healthy             bool
+	Draining            bool
 	ConsecutiveFailures int
 	EWMALatency         float64 // seconds
 	TotalSessions       uint64
@@ -61,6 +63,7 @@ func (u *Upstream) Snapshot() Snapshot {
 		Priority:            u.Priority,
 		Active:              s.active,
 		Healthy:             s.healthy,
+		Draining:            s.draining,
 		ConsecutiveFailures: s.consecutiveFailures,
 	}
 	s.mu.RUnlock()
@@ -77,7 +80,7 @@ func (u *Upstream) Snapshot() Snapshot {
 func (s *State) IncActive(max int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.healthy {
+	if !s.healthy || s.draining {
 		return false
 	}
 	if s.active >= max {
@@ -180,6 +183,23 @@ func (s *State) RecordFailure(threshold int, window time.Duration) (int, bool) {
 		s.healthy = false
 	}
 	return s.consecutiveFailures, tripped
+}
+
+// --- Drain -----------------------------------------------------------------
+
+// SetDrain sets or clears the draining flag. A draining upstream will not
+// accept new sessions but existing ones are unaffected.
+func (s *State) SetDrain(drain bool) {
+	s.mu.Lock()
+	s.draining = drain
+	s.mu.Unlock()
+}
+
+// Draining returns true when the upstream is in drain mode.
+func (s *State) Draining() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.draining
 }
 
 // --- Latency EWMA (lock-free) ----------------------------------------------

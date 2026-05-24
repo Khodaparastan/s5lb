@@ -3,7 +3,7 @@ package strategy
 import (
 	"hash/fnv"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // ConsistentHashSelector uses Rendezvous (HRW) hashing for session affinity.

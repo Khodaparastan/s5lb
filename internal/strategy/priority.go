@@ -1,7 +1,7 @@
 package strategy
 
 import (
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // PriorityFailoverSelector prefers lower-Priority upstreams. Within the same

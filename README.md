@@ -1,4 +1,4 @@
-# socks5lb
+# s5lb
 
 A SOCKS5 load balancer with pluggable strategies, configurable backpressure, UDP ASSOCIATE, OpenTelemetry tracing, Prometheus metrics, two-phase graceful drain, and SIGHUP hot reload.
 
@@ -22,7 +22,7 @@ A SOCKS5 load balancer with pluggable strategies, configurable backpressure, UDP
 ## Layout
 
 ```
-cmd/socks5lb/          # entrypoint
+cmd/s5lb/          # entrypoint
 internal/
   admin/               # /metrics /healthz /readyz /version /admin/reload /debug/pprof
   admission/           # global admission gate + backpressure strategies + session tracker
@@ -40,15 +40,15 @@ internal/
 
 ```bash
 make build
-./bin/socks5lb -version
+./bin/s5lb -version
 ```
 
 ## Quick start
 
 ```bash
-./bin/socks5lb -config config.example.yaml -log-level debug
+./bin/s5lb -config config.example.yaml -log-level debug
 # or flags-only:
-./bin/socks5lb \
+./bin/s5lb \
   -strategy p2c \
   -backpressure drop-oldest \
   -upstream '10.0.0.1:1080#w=3,p=0' \
@@ -124,21 +124,21 @@ socks5.session
 
 ```promql
 # Spread across upstreams
-sum by (upstream) (rate(socks5lb_upstream_selected_total[5m]))
+sum by (upstream) (rate(s5lb_upstream_selected_total[5m]))
 
 # p99 dial latency
 histogram_quantile(0.99,
-  sum by (le, upstream) (rate(socks5lb_upstream_dial_seconds_bucket[5m])))
+  sum by (le, upstream) (rate(s5lb_upstream_dial_seconds_bucket[5m])))
 
 # Queue pressure
-socks5lb_queue_depth
-histogram_quantile(0.99, sum by (le) (rate(socks5lb_queue_wait_seconds_bucket[5m])))
+s5lb_queue_depth
+histogram_quantile(0.99, sum by (le) (rate(s5lb_queue_wait_seconds_bucket[5m])))
 
 # Backpressure evictions per second
-rate(socks5lb_backpressure_evictions_total[1m])
+rate(s5lb_backpressure_evictions_total[1m])
 
 # UDP drop rate by reason
-sum by (reason) (rate(socks5lb_udp_dropped_total[5m]))
+sum by (reason) (rate(s5lb_udp_dropped_total[5m]))
 ```
 
 ## Lifecycle

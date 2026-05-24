@@ -3,8 +3,8 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 GO ?= go
-APP_NAME := socks5lb
-CMD_DIR := ./cmd/socks5lb
+APP_NAME := s5lb
+CMD_DIR := ./cmd/s5lb
 BIN_DIR := $(CURDIR)/bin
 DIST_DIR := $(CURDIR)/dist
 GOFILES := ./cmd ./internal

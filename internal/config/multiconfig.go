@@ -5,9 +5,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/khodaparastan/s5lb/internal/logging"
 	"gopkg.in/yaml.v3"
-
-	"github.com/khodaparastan/socks5lb/internal/logging"
 )
 
 // optionalDuration is a time.Duration that can be absent in YAML.
@@ -111,7 +110,7 @@ func LoadMultiFile(path string) (MultiConfig, error) {
 	}
 	mc.Config.LogLevel = logging.ParseLevel(mc.Config.LogLevelS)
 	if mc.Config.OTel.ServiceName == "" {
-		mc.Config.OTel.ServiceName = "socks5lb"
+		mc.Config.OTel.ServiceName = "s5lb"
 	}
 	return mc, nil
 }

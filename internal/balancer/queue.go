@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/strategy"
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/strategy"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 func (lb *LoadBalancer) pick(sc strategy.SelectCtx) (*upstream.Upstream, bool) {

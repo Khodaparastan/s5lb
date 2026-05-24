@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/config"
 )
 
 // Outcome describes what the gate did with an admission attempt.

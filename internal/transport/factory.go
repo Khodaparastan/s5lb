@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/config"
 )
 
 // NewFromConfig builds the configured upstream transport dialer.

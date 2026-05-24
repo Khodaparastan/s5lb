@@ -3,7 +3,7 @@ package strategy
 import (
 	"math/rand/v2"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // P2CSelector — power-of-two choices. Samples two random eligible upstreams

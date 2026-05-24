@@ -3,7 +3,7 @@ package strategy
 import (
 	"sync/atomic"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // RoundRobinSelector rotates through the pool, skipping ineligible upstreams.

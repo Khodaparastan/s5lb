@@ -4,8 +4,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 func mkSnap(id string, healthy bool, active, weight, prio int) upstream.Snapshot {

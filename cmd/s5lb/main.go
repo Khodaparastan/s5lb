@@ -1,4 +1,4 @@
-// Command socks5lb is a SOCKS5 load-balancing proxy with pluggable strategies,
+// Command s5lb is a SOCKS5 load-balancing proxy with pluggable strategies,
 // configurable backpressure, UDP ASSOCIATE, OpenTelemetry tracing, Prometheus
 // metrics, two-phase graceful drain, SIGHUP hot reload, and multi-group support.
 package main
@@ -14,15 +14,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/khodaparastan/s5lb/internal/admin"
+	"github.com/khodaparastan/s5lb/internal/balancer"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/logging"
+	"github.com/khodaparastan/s5lb/internal/metrics"
+	"github.com/khodaparastan/s5lb/internal/strategy"
+	"github.com/khodaparastan/s5lb/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/khodaparastan/socks5lb/internal/admin"
-	"github.com/khodaparastan/socks5lb/internal/balancer"
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/logging"
-	"github.com/khodaparastan/socks5lb/internal/metrics"
-	"github.com/khodaparastan/socks5lb/internal/strategy"
-	"github.com/khodaparastan/socks5lb/internal/telemetry"
 )
 
 // Build stamps (ldflags).
@@ -48,7 +47,11 @@ func main() {
 		"upstream (repeatable); forms: host:port | user:pass@host:port | "+
 			"socks5://user:pass@host:port?weight=N&priority=N | host:port#w=N,p=N,id=foo")
 
-	strategyFlag := flag.String("strategy", "", "balancing strategy: "+strings.Join(strategy.Names(), " | "))
+	strategyFlag := flag.String(
+		"strategy",
+		"",
+		"balancing strategy: "+strings.Join(strategy.Names(), " | "),
+	)
 	hashKeyFlag := flag.String("hash-key", "", "client-ip | destination | destination-host")
 	backpressureFlag := flag.String("backpressure", "",
 		"reject | wait | drop-oldest | drop-lowest-priority")
@@ -60,7 +63,11 @@ func main() {
 
 	udpEnabled := flag.Bool("udp", true, "enable UDP_ASSOCIATE")
 	otelEnabled := flag.Bool("otel", false, "enable OpenTelemetry tracing")
-	otelEndpoint := flag.String("otel-endpoint", "", "OTLP gRPC endpoint (e.g., otel-collector:4317)")
+	otelEndpoint := flag.String(
+		"otel-endpoint",
+		"",
+		"OTLP gRPC endpoint (e.g., otel-collector:4317)",
+	)
 	otelInsecure := flag.Bool("otel-insecure", true, "disable TLS to OTLP endpoint")
 
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -69,7 +76,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("socks5lb %s (%s) %s [%s]\n",
+		fmt.Printf("s5lb %s (%s) %s [%s]\n",
 			version, commit, runtime.Version(), buildDate)
 		return
 	}
@@ -127,7 +134,10 @@ func main() {
 	effs := mc.EffectiveGroups()
 	for _, eff := range effs {
 		if len(eff.Upstreams) == 0 {
-			fmt.Fprintln(os.Stderr, "error: at least one upstream is required (config or -upstream)")
+			fmt.Fprintln(
+				os.Stderr,
+				"error: at least one upstream is required (config or -upstream)",
+			)
 			flag.Usage()
 			os.Exit(2)
 		}
@@ -139,7 +149,7 @@ func main() {
 	}
 
 	// --- Logger ---
-	log := logging.New(mc.Config.LogLevel, mc.Config.LogFormat, "socks5lb", version)
+	log := logging.New(mc.Config.LogLevel, mc.Config.LogFormat, "s5lb", version)
 	log.Info("starting",
 		"version", version, "commit", commit, "build_date", buildDate,
 		"groups", len(effs),
@@ -175,7 +185,16 @@ func main() {
 	}()
 
 	// --- Manager ---
-	mgr, err := balancer.NewManager(mc, *configPath, log, reg, prov.Tracer, version, commit, buildDate)
+	mgr, err := balancer.NewManager(
+		mc,
+		*configPath,
+		log,
+		reg,
+		prov.Tracer,
+		version,
+		commit,
+		buildDate,
+	)
 	if err != nil {
 		log.Error("manager_init_failed", "err", err.Error())
 		os.Exit(2)

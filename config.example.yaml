@@ -1,4 +1,4 @@
-# socks5lb example config — all fields shown with defaults.
+# s5lb example config — all fields shown with defaults.
 
 listen: "127.0.0.1:1080"
 admin:  "127.0.0.1:9090"
@@ -40,7 +40,7 @@ otel:
   enabled:      false
   endpoint:     ""           # e.g., "otel-collector:4317"
   insecure:     true
-  service_name: "socks5lb"
+  service_name: "s5lb"
   sample_ratio: 1.0
   headers: {}
 

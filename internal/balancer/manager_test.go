@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/metrics"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/trace/noop"
 )

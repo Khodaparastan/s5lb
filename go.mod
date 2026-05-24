@@ -1,4 +1,4 @@
-module github.com/khodaparastan/socks5lb
+module github.com/khodaparastan/s5lb
 
 go 1.26.0
 

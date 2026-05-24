@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -32,7 +32,7 @@ type Providers struct {
 func Init(ctx context.Context, cfg config.OTelConfig, version, commit string) (Providers, error) {
 	if !cfg.Enabled {
 		return Providers{
-			Tracer:   noop.NewTracerProvider().Tracer("socks5lb"),
+			Tracer:   noop.NewTracerProvider().Tracer("s5lb"),
 			Shutdown: func(context.Context) error { return nil },
 		}, nil
 	}
@@ -86,7 +86,7 @@ func Init(ctx context.Context, cfg config.OTelConfig, version, commit string) (P
 	))
 
 	return Providers{
-		Tracer:   tp.Tracer("socks5lb"),
+		Tracer:   tp.Tracer("s5lb"),
 		Shutdown: tp.Shutdown,
 	}, nil
 }

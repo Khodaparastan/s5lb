@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // ParseUpstream accepts any of:

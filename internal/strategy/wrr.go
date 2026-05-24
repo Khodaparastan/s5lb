@@ -3,7 +3,7 @@ package strategy
 import (
 	"sync"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // WRRSelector implements nginx-style smooth weighted round-robin.

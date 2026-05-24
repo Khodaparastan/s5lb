@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // Selector is the interface every load-balancing strategy implements.

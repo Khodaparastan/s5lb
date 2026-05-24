@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/admission"
-	"github.com/khodaparastan/socks5lb/internal/socks5"
+	"github.com/khodaparastan/s5lb/internal/admission"
+	"github.com/khodaparastan/s5lb/internal/socks5"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )

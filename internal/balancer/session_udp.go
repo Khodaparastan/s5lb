@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/admission"
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/socks5"
-	"github.com/khodaparastan/socks5lb/internal/strategy"
+	"github.com/khodaparastan/s5lb/internal/admission"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/socks5"
+	"github.com/khodaparastan/s5lb/internal/strategy"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -181,7 +181,13 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	if err != nil {
 		_, _ = client.Write(socks5.ReplyBytes(socks5.RepGeneralFailure))
 		lb.metrics.SocksReply.WithLabelValues(socks5.ReplyLabel(socks5.RepGeneralFailure)).Inc()
-		log.Warn("udp_advertise_addr_unavailable", "err", err.Error(), "local_udp", localAddr.String())
+		log.Warn(
+			"udp_advertise_addr_unavailable",
+			"err",
+			err.Error(),
+			"local_udp",
+			localAddr.String(),
+		)
 		return
 	}
 
@@ -218,7 +224,16 @@ func (lb *LoadBalancer) handleUDPAssociate(
 	go func() {
 		defer wg.Done()
 		defer relayCancel()
-		lb.udpClientToUpstream(relayCtx, clientPC, upPC, upUDPAddr, allowedClientIP, pin, stats, log)
+		lb.udpClientToUpstream(
+			relayCtx,
+			clientPC,
+			upPC,
+			upUDPAddr,
+			allowedClientIP,
+			pin,
+			stats,
+			log,
+		)
 	}()
 
 	// upstream -> client

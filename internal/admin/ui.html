@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>socks5lb · Console</title>
+<title>s5lb · Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -838,7 +838,7 @@
     <div class="brand">
       <div class="brand-mark"><svg><use href="#i-bolt"/></svg></div>
       <div>
-        <div class="brand-name">socks5lb</div>
+        <div class="brand-name">s5lb</div>
         <div class="brand-sub">console</div>
       </div>
     </div>
@@ -1008,7 +1008,7 @@
                   <div class="empty">
                     <div class="empty-icon"><svg><use href="#i-plug"/></svg></div>
                     <h4>Not connected</h4>
-                    <p>Open the connection drawer to authenticate with your socks5lb instance.</p>
+                    <p>Open the connection drawer to authenticate with your s5lb instance.</p>
                   </div>
                 </td></tr>
               </tbody>
@@ -1138,7 +1138,7 @@ POST  /admin/api/upstreams/{id}/drain?enabled=true</pre>
   };
 
   /* ── persistence ── */
-  const saved = JSON.parse(localStorage.getItem('socks5lb.ui') || '{}');
+  const saved = JSON.parse(localStorage.getItem('s5lb.ui') || '{}');
   const defaultBase = saved.base || (location.origin && location.origin !== 'null' ? location.origin : 'http://127.0.0.1:9090');
   el.apiUrl.value = defaultBase;
   el.apiToken.value = saved.token || '';
@@ -1409,7 +1409,7 @@ POST  /admin/api/upstreams/{id}/drain?enabled=true</pre>
     disconnect();
     state.base  = el.apiUrl.value.trim();
     state.token = el.apiToken.value.trim();
-    localStorage.setItem('socks5lb.ui', JSON.stringify({ base: state.base, token: state.token }));
+    localStorage.setItem('s5lb.ui', JSON.stringify({ base: state.base, token: state.token }));
     closeDrawer();
     setStatus('', 'connecting…');
     refreshOnce(); refreshSessions(); refreshConfig();

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // BackpressureStrategy selects admission behavior when MaxClients is saturated.
@@ -193,7 +193,7 @@ func Defaults() Config {
 		},
 		OTel: OTelConfig{
 			Enabled:     false,
-			ServiceName: "socks5lb",
+			ServiceName: "s5lb",
 			SampleRatio: 1.0,
 		},
 		LogLevel:  slog.LevelInfo,

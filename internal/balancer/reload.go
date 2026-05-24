@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/khodaparastan/socks5lb/internal/admission"
-	"github.com/khodaparastan/socks5lb/internal/config"
-	"github.com/khodaparastan/socks5lb/internal/transport"
+	"github.com/khodaparastan/s5lb/internal/admission"
+	"github.com/khodaparastan/s5lb/internal/config"
+	"github.com/khodaparastan/s5lb/internal/transport"
 )
 
 // reloadFromConfig applies an already-parsed Config snapshot to the LoadBalancer.

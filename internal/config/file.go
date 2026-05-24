@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/khodaparastan/s5lb/internal/logging"
 	"gopkg.in/yaml.v3"
-
-	"github.com/khodaparastan/socks5lb/internal/logging"
 )
 
 // LoadFile reads and parses a YAML config file into a Config, starting from
@@ -22,7 +21,7 @@ func LoadFile(path string) (Config, error) {
 	}
 	cfg.LogLevel = logging.ParseLevel(cfg.LogLevelS)
 	if cfg.OTel.ServiceName == "" {
-		cfg.OTel.ServiceName = "socks5lb"
+		cfg.OTel.ServiceName = "s5lb"
 	}
 	return cfg, nil
 }

@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khodaparastan/socks5lb/internal/socks5"
-	"github.com/khodaparastan/socks5lb/internal/transport"
-	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/khodaparastan/s5lb/internal/socks5"
+	"github.com/khodaparastan/s5lb/internal/transport"
+	"github.com/khodaparastan/s5lb/internal/upstream"
 )
 
 // markHealthy performs the state transition and dispatches any queued waiters.

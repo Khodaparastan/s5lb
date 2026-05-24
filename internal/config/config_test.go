@@ -156,7 +156,7 @@ func TestLoadFile_SampleRatioPreserved(t *testing.T) {
 	cfg.OTel.SampleRatio = 0
 	// Simulate what LoadFile does after unmarshalling (only parseLevel + ServiceName).
 	if cfg.OTel.ServiceName == "" {
-		cfg.OTel.ServiceName = "socks5lb"
+		cfg.OTel.ServiceName = "s5lb"
 	}
 	if cfg.OTel.SampleRatio != 0 {
 		t.Fatalf("sample_ratio overwritten: got %v, want 0", cfg.OTel.SampleRatio)

@@ -58,3 +58,45 @@ upstreams:
     port: 1080
     weight:   1
     priority: 1
+
+# --- Multi-group mode (optional) ---
+# When `groups:` is present, each entry defines a separate upstream pool.
+# Each group can override any data-plane setting (listen, strategy, upstreams, …).
+# Global settings (otel, admin, log_level, transport) are shared.
+# Leave `groups:` absent for single-group backward-compatible mode.
+#
+# groups:
+#   - name: web
+#     listen: "0.0.0.0:1080"
+#     strategy: least-active
+#     backpressure: reject
+#     max_per_proxy: 100
+#     upstreams:
+#       - host: proxy-web-1.internal
+#         port: 1080
+#         weight: 3
+#       - host: proxy-web-2.internal
+#         port: 1080
+#         weight: 1
+#
+#   - name: db
+#     listen: "0.0.0.0:1081"
+#     strategy: round-robin
+#     connect_timeout: 3s
+#     upstreams:
+#       - host: proxy-db-1.internal
+#         port: 1080
+#
+#   - name: k8s
+#     listen: "0.0.0.0:1082"
+#     strategy: least-latency
+#     transport:
+#       type: kubernetes-exec
+#       kubernetes:
+#         namespace: relay
+#         pod: relay-0
+#         container: relay
+#         command: ["/usr/local/bin/kube-socks-relay", "tcp", "{{host}}", "{{port}}"]
+#     upstreams:
+#       - host: internal-svc.cluster.local
+#         port: 8080

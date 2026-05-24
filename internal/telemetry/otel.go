@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/khodaparastan/socks5lb/internal/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
@@ -18,8 +19,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
-
-	"github.com/khodaparastan/socks5lb/internal/config"
 )
 
 // Providers is returned by Init and wraps the tracer plus a shutdown func.

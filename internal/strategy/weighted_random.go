@@ -18,9 +18,9 @@ func (s *WeightedRandomSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, max
 	if len(cands) == 0 {
 		return ""
 	}
-	total := 0
+	var total int64
 	for _, u := range cands {
-		w := u.Weight
+		w := int64(u.Weight)
 		if w <= 0 {
 			w = 1
 		}
@@ -29,9 +29,9 @@ func (s *WeightedRandomSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, max
 	if total <= 0 {
 		return cands[rand.IntN(len(cands))].ID
 	}
-	r := rand.IntN(total)
+	r := rand.Int64N(total)
 	for _, u := range cands {
-		w := u.Weight
+		w := int64(u.Weight)
 		if w <= 0 {
 			w = 1
 		}

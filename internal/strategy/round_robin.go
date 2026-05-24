@@ -17,8 +17,9 @@ func (s *RoundRobinSelector) Pick(_ SelectCtx, pool []upstream.Snapshot, maxPer 
 	if n == 0 {
 		return ""
 	}
+	un := uint64(n)
 	for attempts := 0; attempts < n; attempts++ {
-		i := int(s.idx.Add(1)-1) % n
+		i := (s.idx.Add(1) - 1) % un
 		u := pool[i]
 		if u.Healthy && u.Active < maxPer {
 			return u.ID

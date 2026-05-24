@@ -8,13 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"go.opentelemetry.io/otel/trace/noop"
-
 	"github.com/khodaparastan/socks5lb/internal/config"
 	"github.com/khodaparastan/socks5lb/internal/metrics"
 	"github.com/khodaparastan/socks5lb/internal/strategy"
 	"github.com/khodaparastan/socks5lb/internal/upstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 func newTestLB(t *testing.T, maxPer int, ups []*upstream.Upstream) *LoadBalancer {
@@ -24,9 +23,16 @@ func newTestLB(t *testing.T, maxPer int, ups []*upstream.Upstream) *LoadBalancer
 	cfg.QueueWaitTimeout = 500 * time.Millisecond
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	reg := prometheus.NewRegistry()
-	m := metrics.New(reg, "test", "test", "test")
+	m, err := metrics.New(reg, "test", "test", "test", "test")
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
 	sel, _ := strategy.New("least-active")
-	return New(cfg, "", log, m, noop.NewTracerProvider().Tracer("t"), ups, sel)
+	lb, err := New(cfg, "", log, m, noop.NewTracerProvider().Tracer("t"), ups, sel)
+	if err != nil {
+		t.Fatalf("balancer.New: %v", err)
+	}
+	return lb
 }
 
 func TestAcquireSlot_BasicAndRelease(t *testing.T) {
@@ -56,6 +62,49 @@ func TestAcquireSlot_BasicAndRelease(t *testing.T) {
 		t.Fatal("acquire after release should succeed")
 	}
 	lb.releaseSlot(got3)
+}
+
+// TestDispatch_CancelRace verifies that concurrent dispatch+cancel does not
+// permanently leak upstream active slots (the CRITICAL race fixed in queue.go).
+func TestDispatch_CancelRace(t *testing.T) {
+	u := upstream.New("127.0.0.1", 1, "", "", 1, 0)
+	lb := newTestLB(t, 1, []*upstream.Upstream{u})
+	defer lb.Shutdown()
+
+	// Take the only slot so subsequent acquires will queue.
+	held := lb.acquireSlot(context.Background(), strategy.SelectCtx{}, lb.log)
+	if held == nil {
+		t.Fatal("initial acquire failed")
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			// If a slot is dispatched to this goroutine, release it properly.
+			if got := lb.acquireSlot(ctx, strategy.SelectCtx{}, lb.log); got != nil {
+				lb.releaseSlot(got)
+			}
+		}()
+	}
+
+	// Let waiters queue up, then release the held slot repeatedly to trigger
+	// dispatch races.
+	time.Sleep(10 * time.Millisecond)
+	lb.releaseSlot(held)
+
+	wg.Wait()
+
+	// After all goroutines finish, active count must be 0 (no leaked slots).
+	active := u.State.Active()
+	if active != 0 {
+		t.Fatalf("leaked active slot: u.Active=%d want 0", active)
+	}
 }
 
 func TestDispatch_FIFO(t *testing.T) {

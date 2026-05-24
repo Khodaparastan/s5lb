@@ -3,7 +3,6 @@ package socks5
 import (
 	"bufio"
 	"bytes"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -146,8 +145,24 @@ func TestReadGreeting_EOF(t *testing.T) {
 	in := bytes.NewBuffer(nil)
 	mc := &mockConn{r: in, w: &bytes.Buffer{}}
 	err := ReadGreeting(mc, bufio.NewReader(in))
-	if err == nil || err == io.EOF {
-		// io.ReadFull returns io.ErrUnexpectedEOF on 0-bytes, which is wrapped.
-		// Any error is acceptable; we just don't want a panic.
+	// io.ReadFull returns io.ErrUnexpectedEOF on 0-bytes, which may be wrapped.
+	// We require a non-nil error and no panic.
+	if err == nil {
+		t.Fatal("expected an error on empty input, got nil")
+	}
+	_ = err // suppress unused warning; just verifying no panic and non-nil
+}
+
+func TestReadRequest_NonZeroRSV_Rejected(t *testing.T) {
+	payload := []byte{Version, CmdConnect, 0x01, AtypIPv4, 192, 168, 1, 1, 0x04, 0x38}
+	in := bytes.NewBuffer(payload)
+	out := &bytes.Buffer{}
+	mc := &mockConn{r: in, w: out}
+	_, rw, err := ReadRequest(mc, bufio.NewReader(in))
+	if err == nil {
+		t.Fatal("expected error on nonzero RSV byte")
+	}
+	if rw != RepGeneralFailure {
+		t.Fatalf("rw=%d want=%d (RepGeneralFailure)", rw, RepGeneralFailure)
 	}
 }

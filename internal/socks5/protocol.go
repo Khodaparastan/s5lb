@@ -50,21 +50,28 @@ func BuildReply(rep byte, bindIP net.IP, bindPort uint16) []byte {
 	if bindIP == nil {
 		return ReplyBytes(rep)
 	}
+
 	var atyp byte
 	var addr []byte
+
 	if v4 := bindIP.To4(); v4 != nil {
 		atyp = AtypIPv4
 		addr = v4
-	} else {
+	} else if v6 := bindIP.To16(); v6 != nil {
 		atyp = AtypIPv6
-		addr = bindIP.To16()
+		addr = v6
+	} else {
+		return ReplyBytes(rep)
 	}
+
 	out := make([]byte, 0, 4+len(addr)+2)
 	out = append(out, Version, rep, 0x00, atyp)
 	out = append(out, addr...)
-	portBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBuf, bindPort)
-	out = append(out, portBuf...)
+
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], bindPort)
+	out = append(out, portBuf[:]...)
+
 	return out
 }
 
@@ -124,6 +131,10 @@ func ReadRequest(client net.Conn, br *bufio.Reader) (*Request, byte, error) {
 	if hdr[0] != Version {
 		return nil, 0, errors.New("bad request version")
 	}
+	if hdr[2] != 0x00 {
+		_, _ = client.Write(ReplyBytes(RepGeneralFailure))
+		return nil, RepGeneralFailure, fmt.Errorf("reserved byte must be 0x00, got 0x%02x", hdr[2])
+	}
 	cmd := hdr[1]
 	if cmd != CmdConnect && cmd != CmdUDPAssociate {
 		_, _ = client.Write(ReplyBytes(RepCommandNotSupported))
@@ -171,68 +182,86 @@ func readDest(r io.Reader, atyp byte) ([]byte, uint16, string, error) {
 	default:
 		return nil, 0, "", fmt.Errorf("unsupported atyp 0x%02x", atyp)
 	}
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(r, portBuf); err != nil {
+	var portBuf [2]byte
+	if _, err := io.ReadFull(r, portBuf[:]); err != nil {
 		return nil, 0, "", err
 	}
-	return raw, binary.BigEndian.Uint16(portBuf), label, nil
+	return raw, binary.BigEndian.Uint16(portBuf[:]), label, nil
 }
 
 // ClientHandshake performs RFC 1928 method negotiation + optional RFC 1929
 // user/pass authentication as a SOCKS5 *client* (when dialing an upstream).
 func ClientHandshake(conn net.Conn, user, pass string) error {
 	haveCreds := user != "" || pass != ""
+
 	var greet []byte
 	if haveCreds {
 		greet = []byte{Version, 0x02, AuthNone, AuthUserPass}
 	} else {
 		greet = []byte{Version, 0x01, AuthNone}
 	}
+
 	if _, err := conn.Write(greet); err != nil {
 		return fmt.Errorf("write greeting: %w", err)
 	}
+
 	resp := make([]byte, 2)
 	if _, err := io.ReadFull(conn, resp); err != nil {
 		return fmt.Errorf("read greeting reply: %w", err)
 	}
+
 	if resp[0] != Version {
 		return fmt.Errorf("bad version %d", resp[0])
 	}
+
 	switch resp[1] {
 	case AuthNone:
 		return nil
+
 	case AuthUserPass:
 		if !haveCreds {
 			return errors.New("upstream requires auth but no credentials configured")
 		}
+
 		u, p := []byte(user), []byte(pass)
 		if len(u) > 255 || len(p) > 255 {
 			return errors.New("credential exceeds 255 bytes")
 		}
+
 		req := make([]byte, 0, 3+len(u)+len(p))
 		req = append(req, 0x01, byte(len(u)))
 		req = append(req, u...)
 		req = append(req, byte(len(p)))
 		req = append(req, p...)
+
 		if _, err := conn.Write(req); err != nil {
 			return fmt.Errorf("write auth: %w", err)
 		}
+
 		ar := make([]byte, 2)
 		if _, err := io.ReadFull(conn, ar); err != nil {
 			return fmt.Errorf("read auth reply: %w", err)
 		}
+
+		if ar[0] != 0x01 {
+			return fmt.Errorf("bad auth reply version %d", ar[0])
+		}
+
 		if ar[1] != 0x00 {
 			return errors.New("auth rejected")
 		}
+
 		return nil
+
 	case AuthNoAccept:
 		return errors.New("no acceptable auth methods")
+
 	default:
 		return fmt.Errorf("unsupported auth method 0x%02x", resp[1])
 	}
 }
 
-// ClientRequest is the reply summary of a SOCKS5 request from an upstream.
+// ClientRequestReply is the reply summary of a SOCKS5 request from an upstream.
 type ClientRequestReply struct {
 	Rep      byte
 	BindAtyp byte
@@ -243,25 +272,40 @@ type ClientRequestReply struct {
 
 // ClientConnect issues CONNECT over an authenticated session and returns
 // the upstream's reply (including the bind address, which matters for UDP).
-func ClientConnect(conn net.Conn, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+func ClientConnect(
+	conn net.Conn,
+	atyp byte,
+	rawAddr []byte,
+	port uint16,
+) (ClientRequestReply, error) {
 	return clientRequest(conn, CmdConnect, atyp, rawAddr, port)
 }
 
 // ClientUDPAssociate issues UDP_ASSOCIATE and returns the upstream's reply.
 // The bind address in the reply is the upstream's UDP relay endpoint.
-func ClientUDPAssociate(conn net.Conn, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+func ClientUDPAssociate(
+	conn net.Conn,
+	atyp byte,
+	rawAddr []byte,
+	port uint16,
+) (ClientRequestReply, error) {
 	return clientRequest(conn, CmdUDPAssociate, atyp, rawAddr, port)
 }
 
-func clientRequest(conn net.Conn, cmd, atyp byte, rawAddr []byte, port uint16) (ClientRequestReply, error) {
+func clientRequest(
+	conn net.Conn,
+	cmd, atyp byte,
+	rawAddr []byte,
+	port uint16,
+) (ClientRequestReply, error) {
 	var out ClientRequestReply
 
+	var portBufReq [2]byte
+	binary.BigEndian.PutUint16(portBufReq[:], port)
 	req := make([]byte, 0, 6+len(rawAddr))
 	req = append(req, Version, cmd, 0x00, atyp)
 	req = append(req, rawAddr...)
-	portBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBuf, port)
-	req = append(req, portBuf...)
+	req = append(req, portBufReq[:]...)
 	if _, err := conn.Write(req); err != nil {
 		return out, fmt.Errorf("write request: %w", err)
 	}
@@ -272,6 +316,9 @@ func clientRequest(conn net.Conn, cmd, atyp byte, rawAddr []byte, port uint16) (
 	}
 	if hdr[0] != Version {
 		return out, errors.New("bad reply version")
+	}
+	if hdr[2] != 0x00 {
+		return out, fmt.Errorf("reply reserved byte must be 0x00, got 0x%02x", hdr[2])
 	}
 	out.Rep = hdr[1]
 	out.BindAtyp = hdr[3]
@@ -302,11 +349,11 @@ func clientRequest(conn net.Conn, cmd, atyp byte, rawAddr []byte, port uint16) (
 	default:
 		return out, fmt.Errorf("bad reply atyp 0x%02x", hdr[3])
 	}
-	pb := make([]byte, 2)
-	if _, err := io.ReadFull(conn, pb); err != nil {
+	var pb [2]byte
+	if _, err := io.ReadFull(conn, pb[:]); err != nil {
 		return out, err
 	}
-	out.BindPort = binary.BigEndian.Uint16(pb)
+	out.BindPort = binary.BigEndian.Uint16(pb[:])
 	return out, nil
 }
 

@@ -34,6 +34,10 @@ type UDPDatagram struct {
 // single datagram. Fragmented datagrams (FRAG != 0) are not supported and
 // return an error per common practice; RFC technically allows reassembly but
 // no real client relies on it.
+//
+// WARNING: The returned UDPDatagram.DstIP and UDPDatagram.Data fields alias
+// the input slice pkt. Callers that retain the result after reusing the buffer
+// must copy those fields themselves.
 func DecodeUDPDatagram(pkt []byte) (*UDPDatagram, error) {
 	if len(pkt) < 10 {
 		return nil, errors.New("udp datagram too short")
@@ -91,21 +95,27 @@ func DecodeUDPDatagram(pkt []byte) (*UDPDatagram, error) {
 func EncodeUDPDatagram(dstIP net.IP, dstHost string, dstPort uint16, data []byte) ([]byte, error) {
 	var atyp byte
 	var addrBytes []byte
+
 	switch {
 	case dstIP != nil:
 		if v4 := dstIP.To4(); v4 != nil {
 			atyp = AtypIPv4
 			addrBytes = v4
-		} else {
+		} else if v6 := dstIP.To16(); v6 != nil {
 			atyp = AtypIPv6
-			addrBytes = dstIP.To16()
+			addrBytes = v6
+		} else {
+			return nil, errors.New("udp encode: invalid destination IP")
 		}
+
 	case dstHost != "":
 		if len(dstHost) > 255 {
 			return nil, errors.New("udp domain too long")
 		}
+
 		atyp = AtypDomain
 		addrBytes = append([]byte{byte(len(dstHost))}, []byte(dstHost)...)
+
 	default:
 		return nil, errors.New("udp encode: no destination")
 	}
@@ -113,9 +123,11 @@ func EncodeUDPDatagram(dstIP net.IP, dstHost string, dstPort uint16, data []byte
 	out := make([]byte, 0, 4+len(addrBytes)+2+len(data))
 	out = append(out, 0x00, 0x00, 0x00, atyp)
 	out = append(out, addrBytes...)
-	portBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBuf, dstPort)
-	out = append(out, portBuf...)
+
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], dstPort)
+	out = append(out, portBuf[:]...)
 	out = append(out, data...)
+
 	return out, nil
 }

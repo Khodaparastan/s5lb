@@ -21,7 +21,9 @@ func ParseUpstream(spec string) (*upstream.Upstream, error) {
 
 	// Trailing "#k=v,k=v" shorthand.
 	if hash := strings.Index(spec, "#"); hash >= 0 {
-		applyShorthand(u, spec[hash+1:])
+		if err := applyShorthand(u, spec[hash+1:]); err != nil {
+			return nil, fmt.Errorf("shorthand: %w", err)
+		}
 		spec = spec[:hash]
 	}
 
@@ -37,8 +39,8 @@ func ParseUpstream(spec string) (*upstream.Upstream, error) {
 	if at := strings.LastIndex(spec, "@"); at >= 0 {
 		creds := spec[:at]
 		hp = spec[at+1:]
-		if colon := strings.Index(creds, ":"); colon >= 0 {
-			u.Username, u.Password = creds[:colon], creds[colon+1:]
+		if before, after, ok := strings.Cut(creds, ":"); ok {
+			u.Username, u.Password = before, after
 		} else {
 			u.Username = creds
 		}
@@ -47,13 +49,25 @@ func ParseUpstream(spec string) (*upstream.Upstream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("split host:port %q: %w", hp, err)
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err := parsePort(portStr)
 	if err != nil {
-		return nil, fmt.Errorf("port %q: %w", portStr, err)
+		return nil, err
 	}
 	u.Host, u.Port = host, port
 	u.NormalizeID()
 	return u, nil
+}
+
+// parsePort parses a port string and validates it is in [1,65535].
+func parsePort(portStr string) (int, error) {
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("port %q: %w", portStr, err)
+	}
+	if port < 1 || port > 65535 {
+		return 0, fmt.Errorf("port %d out of range [1,65535]", port)
+	}
+	return port, nil
 }
 
 func parseURLForm(u *upstream.Upstream, spec string) error {
@@ -74,50 +88,67 @@ func parseURLForm(u *upstream.Upstream, spec string) error {
 	if err != nil {
 		return err
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err := parsePort(portStr)
 	if err != nil {
 		return err
 	}
 	u.Host, u.Port = host, port
-	applyQuery(u, p.Query())
-	return nil
+	return applyQuery(u, p.Query())
 }
 
-func applyQuery(u *upstream.Upstream, q url.Values) {
+func applyQuery(u *upstream.Upstream, q url.Values) error {
 	if v := q.Get("weight"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			u.Weight = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid weight %q: %w", v, err)
 		}
+		if n <= 0 {
+			return fmt.Errorf("weight must be > 0, got %d", n)
+		}
+		u.Weight = n
 	}
 	if v := q.Get("priority"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			u.Priority = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid priority %q: %w", v, err)
 		}
+		u.Priority = n
 	}
 	if v := q.Get("id"); v != "" {
 		u.ID = v
 	}
+	return nil
 }
 
-func applyShorthand(u *upstream.Upstream, s string) {
-	for _, kv := range strings.Split(s, ",") {
+func applyShorthand(u *upstream.Upstream, s string) error {
+	for kv := range strings.SplitSeq(s, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
-			continue
+			return fmt.Errorf("invalid shorthand pair %q", kv)
 		}
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		switch key {
 		case "w", "weight":
-			if n, err := strconv.Atoi(val); err == nil && n > 0 {
-				u.Weight = n
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid weight %q: %w", val, err)
 			}
+			if n <= 0 {
+				return fmt.Errorf("weight must be > 0, got %d", n)
+			}
+			u.Weight = n
 		case "p", "priority":
-			if n, err := strconv.Atoi(val); err == nil {
-				u.Priority = n
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid priority %q: %w", val, err)
 			}
+			u.Priority = n
 		case "id":
 			u.ID = val
+		default:
+			return fmt.Errorf("unknown shorthand key %q", key)
 		}
 	}
+	return nil
 }

@@ -1,0 +1,102 @@
+# s5lb example config — all fields shown with defaults.
+
+listen: "127.0.0.1:1080"
+admin:  "127.0.0.1:9090"
+
+max_per_proxy: 100
+max_clients:   4096
+
+health_interval:    20s
+retry_backoff:      30s
+connect_timeout:    5s
+handshake_timeout:  10s
+queue_wait_timeout: 10s
+
+failure_threshold: 5
+failure_window:    30s
+
+idle_timeout: 0s  # 0 enables splice(2) fast path on Linux
+
+drain_soft_timeout: 20s
+drain_hard_timeout: 10s
+
+tcp_keepalive: true
+
+strategy: "least-active"
+# one of:
+#   least-active, round-robin, weighted-round-robin, random,
+#   weighted-random, p2c, least-latency, consistent-hash, priority-failover
+hash_key: "client-ip"   # client-ip | destination | destination-host
+
+backpressure: "reject"
+# one of: reject | wait | drop-oldest | drop-lowest-priority
+admission_wait_timeout: 2s
+
+udp_enabled:      true
+udp_bind:         ""       # empty = host portion of `listen`
+udp_idle_timeout: 60s
+
+otel:
+  enabled:      false
+  endpoint:     ""           # e.g., "otel-collector:4317"
+  insecure:     true
+  service_name: "s5lb"
+  sample_ratio: 1.0
+  headers: {}
+
+log_level:  "info"   # debug | info | warn | error
+log_format: "json"   # json | text
+
+upstreams:
+  - host: "10.0.0.1"
+    port: 1080
+    username: "user"
+    password: "pass"
+    weight:   3
+    priority: 0
+  - host: "10.0.0.2"
+    port: 1080
+    weight:   1
+    priority: 1
+
+# --- Multi-group mode (optional) ---
+# When `groups:` is present, each entry defines a separate upstream pool.
+# Each group can override any data-plane setting (listen, strategy, upstreams, …).
+# Global settings (otel, admin, log_level, transport) are shared.
+# Leave `groups:` absent for single-group backward-compatible mode.
+#
+# groups:
+#   - name: web
+#     listen: "0.0.0.0:1080"
+#     strategy: least-active
+#     backpressure: reject
+#     max_per_proxy: 100
+#     upstreams:
+#       - host: proxy-web-1.internal
+#         port: 1080
+#         weight: 3
+#       - host: proxy-web-2.internal
+#         port: 1080
+#         weight: 1
+#
+#   - name: db
+#     listen: "0.0.0.0:1081"
+#     strategy: round-robin
+#     connect_timeout: 3s
+#     upstreams:
+#       - host: proxy-db-1.internal
+#         port: 1080
+#
+#   - name: k8s
+#     listen: "0.0.0.0:1082"
+#     strategy: least-latency
+#     transport:
+#       type: kubernetes-exec
+#       kubernetes:
+#         namespace: relay
+#         pod: relay-0
+#         container: relay
+#         command: ["/usr/local/bin/kube-socks-relay", "tcp", "{{host}}", "{{port}}"]
+#     upstreams:
+#       - host: internal-svc.cluster.local
+#         port: 8080

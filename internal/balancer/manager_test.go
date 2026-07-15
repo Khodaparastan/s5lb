@@ -2,9 +2,12 @@ package balancer
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +79,38 @@ func sprintf(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+func waitForTCPListener(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("listener did not become reachable on %s", addr)
+}
+
+func writeManagerConfigYAML(t *testing.T, path string, groupName, listen string) {
+	t.Helper()
+	content := fmt.Sprintf(`listen: "127.0.0.1:0"
+upstreams:
+  - host: 127.0.0.1
+    port: 9001
+groups:
+  - name: %s
+    listen: "%s"
+    upstreams:
+      - host: 127.0.0.1
+        port: 9001
+`, groupName, listen)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
 }
 
 // TestNewManager_SingleGroup verifies backward-compat single-group creation.
@@ -281,5 +316,68 @@ func TestManager_ReloadGroup_NotFound(t *testing.T) {
 	}
 	if err := mgr.ReloadGroup("nonexistent"); err == nil {
 		t.Error("expected error for unknown group, got nil")
+	}
+}
+
+func TestManager_Reload_RenameGroupReusingListenAddr(t *testing.T) {
+	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+
+	cfgPath := filepath.Join(t.TempDir(), "manager.yaml")
+	writeManagerConfigYAML(t, cfgPath, "ExecTunnel-3", listen)
+
+	mc, err := config.LoadMultiFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadMultiFile(initial): %v", err)
+	}
+
+	reg := testReg(t)
+	if err := metrics.RegisterBuildInfo(reg, "test", "test", "test"); err != nil {
+		t.Fatalf("RegisterBuildInfo: %v", err)
+	}
+
+	mgr, err := NewManager(
+		mc,
+		cfgPath,
+		testLog(),
+		reg,
+		noop.NewTracerProvider().Tracer("t"),
+		"test",
+		"test",
+		"test",
+	)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- mgr.Start(context.Background())
+	}()
+
+	waitForTCPListener(t, listen)
+	writeManagerConfigYAML(t, cfgPath, "ExecTunnel-x", listen)
+
+	if err := mgr.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	select {
+	case err := <-startErr:
+		if err != nil {
+			if strings.Contains(err.Error(), "address already in use") {
+				t.Fatalf("manager exited due to bind conflict after reload: %v", err)
+			}
+			t.Fatalf("manager exited unexpectedly after reload: %v", err)
+		}
+		t.Fatal("manager exited unexpectedly after reload")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	mgr.Shutdown()
+
+	select {
+	case <-startErr:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Manager.Start did not return after Shutdown")
 	}
 }

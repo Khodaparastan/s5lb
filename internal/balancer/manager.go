@@ -361,6 +361,7 @@ func (m *Manager) Reload() error {
 	// Reload or add groups from the new config.
 	newByName := make(map[string]*groupEntry, len(effs))
 	newGroups := make([]*groupEntry, 0, len(effs))
+	pendingStarts := make([]*groupEntry, 0, len(effs))
 
 	for _, cfg := range effs {
 		name := cfg.GroupName
@@ -383,21 +384,53 @@ func (m *Manager) Reload() error {
 			}
 			newByName[name] = entry
 			newGroups = append(newGroups, entry)
-			m.startGroupLocked(entry)
+			pendingStarts = append(pendingStarts, entry)
 		}
 	}
 
 	// Mark and drain groups that are no longer in the config. The supervisor
 	// loop ignores retired group exits, so this cannot trigger a global shutdown.
+	removed := make([]*groupEntry, 0)
+	removedByListen := make(map[string][]*groupEntry)
 	for name, old := range m.byName {
 		if _, kept := newByName[name]; !kept {
 			m.log.Info("reload_group_removed", "group", name)
 			old.retired.Store(true)
-			go func(e *groupEntry) {
-				e.lb.Shutdown()
-				e.met.Unregister()
-			}(old)
+			removed = append(removed, old)
+			listen := old.lb.Config().ListenAddr
+			removedByListen[listen] = append(removedByListen[listen], old)
 		}
+	}
+
+	// If a new group needs a listen address currently held by a removed group,
+	// drain that removed group synchronously first to avoid bind races.
+	drained := make(map[*groupEntry]struct{})
+	for _, entry := range pendingStarts {
+		listen := entry.lb.Config().ListenAddr
+		olds := removedByListen[listen]
+		if len(olds) == 0 {
+			continue
+		}
+		for _, old := range olds {
+			old.lb.Shutdown()
+			old.met.Unregister()
+			drained[old] = struct{}{}
+		}
+		delete(removedByListen, listen)
+	}
+
+	for _, old := range removed {
+		if _, alreadyDrained := drained[old]; alreadyDrained {
+			continue
+		}
+		go func(e *groupEntry) {
+			e.lb.Shutdown()
+			e.met.Unregister()
+		}(old)
+	}
+
+	for _, entry := range pendingStarts {
+		m.startGroupLocked(entry)
 	}
 
 	m.groups = newGroups
